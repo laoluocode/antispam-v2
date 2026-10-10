@@ -15,6 +15,7 @@ L0 只保留三类**确定性事实**：
 """
 
 import re
+import time
 from typing import NamedTuple
 
 from utils.normalize import invisible_ratio, normalize
@@ -328,6 +329,109 @@ def check_inline_buttons(button_texts: list[str],
                          r"channel|group|link|bonus|reward)", tt, re.I):
                 return Verdict(True, f"广告按钮（{tt[:14]}）")
     return _NO_HIT
+
+
+# ---------------------------------------------------------------------------
+# 自进化规则加载
+# ---------------------------------------------------------------------------
+
+# 规则缓存。学习任务写完库后由 pipeline 触发 force 重载。
+_pattern_cache: list = []
+_pattern_cache_at = 0.0
+PATTERN_CACHE_TTL = 300.0
+
+
+def load_patterns(force: bool = False) -> list:
+    """从库里加载自进化规则到缓存。返回 [(pattern, kind, hits), ...]。
+
+    active 规则用于 L0 直拦（0ms 删除）；shadow 规则在判定时并行记录命中，
+    不影响决定——这是"先观察再放权"的安全阀。
+    """
+    global _pattern_cache, _pattern_cache_at
+    now = time.time()
+    if not force and now - _pattern_cache_at < PATTERN_CACHE_TTL:
+        return _pattern_cache
+    try:
+        from database import active_patterns, patterns_for_shadow
+    except ImportError:
+        from db import active_patterns, patterns_for_shadow
+    try:
+        active = [(r["pattern"], "active", r["hit_count"] or 0)
+                  for r in active_patterns()]
+        shadow = [(r["pattern"], "shadow", r["shadow_hits"] or 0)
+                  for r in patterns_for_shadow()]
+        _pattern_cache = active + shadow
+        _pattern_cache_at = now
+    except Exception:  # noqa: BLE001
+        pass
+    return _pattern_cache
+
+
+def check_learned_patterns(text: str) -> Verdict:
+    """用**已毕业**（active）的自进化规则做 L0 直拦。
+
+    这些规则经过了"负样本零命中"闸门与 shadow 观察期，才有资格直拦。
+    shadow 规则不在这里生效——它们的命中由 record_shadow_hits() 记录。
+    """
+    t = text or ""
+    if not t:
+        return _NO_HIT
+    norm = normalize(t)
+    for pattern, mode, _hits in load_patterns():
+        if mode != "active":
+            continue
+        if _pattern_matches(pattern, t, norm):
+            return Verdict(True, f"自进化规则命中（{pattern[:16]}）")
+    return _NO_HIT
+
+
+def _pattern_matches(pattern: str, raw: str, norm: str) -> bool:
+    """判断一条自进化规则是否命中。
+
+    · 行为类（`__invisible_ratio__` 等）走专门的判定
+    · 域类（t.me/xxx、example.com）在原文与归一化文本里找
+    · 其余（签名/短语）在归一化文本里找——签名与短语都是归一化后的形态
+    """
+    if pattern == "__invisible_ratio__":
+        return len(raw) >= INVISIBLE_MIN_LENGTH and \
+            invisible_ratio(raw) >= INVISIBLE_RATIO_THRESHOLD
+    if pattern == "__bare_letter__":
+        return is_bare_letter(raw)
+    if pattern.startswith("t.me/") or _DOMAIN_LIKE.match(pattern):
+        return pattern in raw.lower() or pattern in norm
+    return pattern and pattern in norm
+
+
+def record_shadow_hits(text: str, is_spam: bool) -> list[str]:
+    """记录 shadow 规则在本条消息上的命中情况。
+
+    返回命中的规则列表。**只在真值已知时调用**（例如 LLM 判完之后），
+    这样 shadow_spam_hits / shadow_hits 才能反映该规则的准确率。
+    """
+    t = text or ""
+    if not t:
+        return []
+    norm = normalize(t)
+    hits = []
+    for pattern, mode, _hits in load_patterns():
+        if mode != "shadow":
+            continue
+        if _pattern_matches(pattern, t, norm):
+            hits.append(pattern)
+    if hits:
+        try:
+            from database import bump_pattern
+        except ImportError:
+            from db import bump_pattern
+        for pattern in hits:
+            try:
+                bump_pattern(pattern, shadow_hit=True, spam_hit=is_spam)
+            except Exception:  # noqa: BLE001
+                pass
+    return hits
+
+
+_DOMAIN_LIKE = re.compile(r"^[a-z0-9.\-]+\.[a-z]{2,}$", re.I)
 
 
 def check_repeat(text: str, recent_texts: list[str], threshold: int = 3) -> Verdict:

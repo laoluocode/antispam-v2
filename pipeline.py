@@ -34,9 +34,12 @@ from detector_rules import (
     check_bare_letter_spam,
     check_external_channel_link,
     check_inline_buttons,
+    check_learned_patterns,
     check_local,
     check_repeat,
     compute_trust,
+    load_patterns,
+    record_shadow_hits,
     trust_marker,
 )
 from link_preview import has_link_preview, preview_fingerprint
@@ -242,6 +245,13 @@ class ChatPipeline:
             await asyncio.to_thread(db.mark_checked, [msg.row_id])
             return Verdict(msg, True, 1.0, "local_rule", v.reason)
 
+        # --- 自进化规则（已毕业的直拦）---
+        # 这些规则通过了"负样本零命中"闸门与 shadow 观察期，才有资格直拦。
+        lv = check_learned_patterns(msg.text)
+        if lv.hit:
+            await asyncio.to_thread(db.mark_checked, [msg.row_id])
+            return Verdict(msg, True, 1.0, "learned", lv.reason)
+
         # --- inline 按钮检测 ---
         # 广告号把广告做成按钮（"加入频道｜领取福利"），正文可以完全干净。
         if msg.button_texts or msg.button_urls:
@@ -416,6 +426,21 @@ class ChatPipeline:
         scores = {int(v["id"]): float(v.get("confidence", 0.0))
                   for v in parsed.get("verdicts", [])
                   if "id" in v}
+        # 判定阈值。放在这里是因为下面的 shadow 统计与后续分级都要用，
+        # 早先定义在分级处会把 shadow 记录变成 NameError。
+        cut = float(cfg.get("confidence_cut", 0.5))
+        # 记录 shadow 规则命中（此时每条的真值已知，可用于统计准确率）。
+        # 这是"先观察再放权"的关键：shadow 规则不影响决定，只积累证据。
+        for m in batch:
+            conf = scores.get(m.row_id)
+            if conf is None:
+                continue
+            try:
+                await asyncio.to_thread(
+                    record_shadow_hits, m.text, conf >= cut)
+            except Exception:  # noqa: BLE001
+                pass
+
         # 判定成功的部分立即标记已检测。
         # 漏掉这一步会让消息永远停在未检测状态，每轮被重新取出来判定。
         judged = [m.row_id for m in batch if m.row_id in scores]
@@ -430,7 +455,6 @@ class ChatPipeline:
                 await asyncio.to_thread(
                     self._requeue, [m for m in missing if m.row_id in set(keep)])
 
-        cut = float(cfg.get("confidence_cut", 0.5))
         shadow = bool(cfg.get("shadow_mode", 1))
 
         verdicts: list[Verdict] = []

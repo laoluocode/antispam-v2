@@ -402,7 +402,11 @@ async def main():
     import pipeline as _pl
 
     print("  最小批门槛: fast=%d slow=%d" % (_pl.MIN_BATCH_FAST, _pl.MIN_BATCH_SLOW))
-    assert _pl.MIN_BATCH_FAST >= 10 and _pl.MIN_BATCH_SLOW >= 10, "门槛过小起不到摊薄作用"
+    # fast=0 表示不设门槛、严格按 15 秒窗口触发（实时性优先的配置）。
+    # 这里只断言"要么不设门槛，要么门槛足够大到能摊薄前缀成本"。
+    assert _pl.MIN_BATCH_FAST == 0 or _pl.MIN_BATCH_FAST >= 10, \
+        "快车道门槛要么关闭(0)，要么足够大"
+    assert _pl.MIN_BATCH_SLOW >= 10, "慢车道门槛过小起不到摊薄作用"
 
     cid7 = -800
     db.register_chat(cid7, "回捞测试群", "general", shadow_mode=False)
@@ -449,6 +453,73 @@ async def main():
           % (fake.calls == before_calls, stayed))
     assert fake.calls == before_calls, "超预算不应调用 LLM"
     assert stayed > 0, "超预算应回队而非永久丢弃"
+
+    print("=== 17. 回归：自进化规则（挖掘 -> shadow -> 毕业 -> L0 直拦）===")
+    import learner
+    from detector_rules import (
+        check_learned_patterns, load_patterns, record_shadow_hits,
+    )
+
+    cid8 = -900
+    db.register_chat(cid8, "自进化测试群", "general", shadow_mode=False)
+    db.set_chat_field(cid8, "shadow_mode", 0)
+
+    SPAM = (["来洗mi 挣一万"] * 6
+            + ["充电宝投放，日入过w的新项目"] * 6
+            + ["加我 https://t.me/wdgx 详聊", "看 https://t.me/wdgx 这个",
+               "https://t.me/wdgx", "https://t.me/wdgx/123"])
+    HAM = ["今天在汉口修的车体验还行", "开课了老师怎么样", "武汉95养生哪里好",
+           "导航", "签到", "有空", "在的", "好的", "1", "666",
+           "分享个链接 https://t.me/wuhanjp 榜单", "全套多少钱", "这个服务态度不错"]
+    for i, t in enumerate(SPAM):
+        db.save_message(cid8, 5000 + i, 1, "广告号", t, None, "2026-10-10 12:00:00")
+        db.save_spam_record(cid8, 1, "广告号", 5000 + i, t, 0.9, "llm", "delete")
+    for i, t in enumerate(HAM):
+        db.save_message(cid8, 6000 + i, 2, "群友", t, None, "2026-10-10 12:00:00")
+
+    st = learner.refresh_candidates(cid8)
+    print("  挖掘: 候选=%d 过闸=%d 入库=%d" % (st["candidates"], st["passed"], st["added"]))
+    assert st["passed"] > 0, "应有候选通过零命中闸门"
+
+    pats = db.patterns_for_shadow()
+    print("  shadow 规则:")
+    for r in pats:
+        print("    %r" % r["pattern"][:36])
+    # 闸门必须挡住含正常语料的候选
+    report = learner.validation_report(cid8)
+    print("  被闸门拦住 %d 条（有正常消息命中的）" % len(report["blocked"]))
+    for c in report["blocked"][:3]:
+        print("    spam=%s ham=%s %r" % (c.spam_hits, c.ham_hits, c.pattern[:30]))
+
+    # shadow 阶段不应影响判定
+    load_patterns(force=True)
+    v = check_learned_patterns("来洗mi 挣一万")
+    print("  shadow 规则是否直接拦截: %s (应为 False，观察期内不决定)"
+          % v.hit)
+    assert not v.hit, "shadow 规则不应直拦"
+
+    # 记录 shadow 命中（模拟 LLM 判完）
+    hits = record_shadow_hits("来洗mi 挣一万", is_spam=True)
+    print("  record_shadow_hits 命中: %s" % [h[:20] for h in hits])
+    assert hits, "应记录到 shadow 命中"
+
+    # 攒够观察期 -> 毕业
+    for r in db.patterns_for_shadow():
+        for _ in range(12):
+            db.bump_pattern(r["pattern"], shadow_hit=True, spam_hit=True)
+    eligible = learner.eligible_for_promotion(cid8)
+    print("  可毕业 %d 条" % len(eligible))
+    promoted = learner.run_lifecycle(cid8)["promoted"]
+    print("  已毕业: %s" % [p[:24] for p in promoted])
+    load_patterns(force=True)
+    v = check_learned_patterns("来洗mi 挣一万")
+    print("  毕业后直拦: %s (%s)" % (v.hit, v.reason))
+    assert v.hit, "毕业后应在 L0 直拦"
+
+    # 正常消息不应被自进化规则命中
+    fp = [t for t in HAM if check_learned_patterns(t).hit]
+    print("  正常语料误伤: %s (应为空)" % fp)
+    assert not fp, "自进化规则不该命中正常语料"
 
     os.unlink(tmp)
     print("\n全部通过")

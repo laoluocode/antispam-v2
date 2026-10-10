@@ -20,6 +20,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import db
+import detector_rules
+import learner
 from prompts import NATURE_PRESETS
 
 # 严格档位 -> 阈值。
@@ -130,6 +132,80 @@ def cmd_words(args) -> None:
         print("  manage.py words -100xxx --add 尾课 --blocked")
         print("  manage.py words -100xxx --remove 导航")
         print("  manage.py words -100xxx          # 只看当前词表")
+
+
+def cmd_learn(args) -> None:
+    """自进化：挖候选 / 看验证报告 / 手工触发毕业。
+
+    规则的价值是**速度**而不是省钱——实测 LLM 单次判定约 0.0005 元，
+    钱不是瓶颈；规则能 0ms 删除，这才是不需要等 AI 的意义。
+    所以这里的闸门卡得很死：**候选必须在全部正常消息语料上零命中**
+    才有资格直拦。V1 用"命中 3 次 + 准确率 100%"导致 224 条通用词规则
+    变成静默秒删机器，不能再犯。
+    """
+    cid = args.chat_id
+    if not db.get_chat(cid):
+        print(f"群 {cid} 不存在")
+        return
+
+    if args.promote:
+        promoted = []
+        for row in learner.eligible_for_promotion(cid)[:args.limit]:
+            db.promote_pattern(row["id"])
+            promoted.append(row["pattern"])
+        if promoted:
+            detector_rules.load_patterns(force=True)
+            print(f"已毕业 {len(promoted)} 条为直拦规则:")
+            for p in promoted:
+                print(f"  {p!r}")
+        else:
+            print("没有满足毕业条件的规则"
+                  "（需 shadow 命中 >= %d 且观察期内零误命中）"
+                  % learner.MIN_SHADOW_HITS)
+        return
+
+    if args.run:
+        st = learner.run_lifecycle(cid)
+        detector_rules.load_patterns(force=True)
+        print("自进化执行结果:")
+        print(f"  语料: 广告 {st.get('spam')} 条 / 正常 {st.get('ham')} 条")
+        print(f"  候选 {st.get('candidates')} 个，过闸 {st.get('passed')} 个，"
+              f"新增 shadow {st.get('added')} 个")
+        if st.get("promoted"):
+            print(f"  本轮毕业: {[p[:30] for p in st['promoted']]}")
+        return
+
+    rep = learner.validation_report(cid)
+    print(f"群 {cid} 自进化状态")
+    print(f"  语料: 广告 {rep['spam']} 条 / 正常 {rep['ham']} 条")
+    print(f"  候选合计 {rep['total']} 个")
+    print()
+    print("  --- 通过零命中闸门（可入 shadow）---")
+    if not rep["passed"]:
+        print("    （无）")
+    for c in rep["passed"]:
+        print(f"    {c.kind:9s} 广告命中{c.spam_hits:3d} 正常命中{c.ham_hits}  "
+              f"{c.pattern[:40]!r}")
+    print()
+    print("  --- 被闸门拦住（在正常消息里出现过，不予入库）---")
+    if not rep["blocked"]:
+        print("    （无）")
+    for c in rep["blocked"]:
+        print(f"    {c.kind:9s} 广告{c.spam_hits:3d} 正常{c.ham_hits:3d}  "
+              f"{c.pattern[:40]!r}")
+    print()
+    shadow = db.patterns_for_shadow()
+    active = db.active_patterns()
+    print(f"  --- shadow 观察中（{len(shadow)} 条，不影响判定）---")
+    for r in shadow[:15]:
+        h, sh = r["shadow_hits"] or 0, r["shadow_spam_hits"] or 0
+        print(f"    命中{h:4d} 其中广告{sh:4d}  {r['pattern'][:40]!r}")
+    print()
+    print(f"  --- 已毕业直拦（{len(active)} 条，L0 秒删）---")
+    for r in active[:15]:
+        print(f"    命中{r['hit_count'] or 0:5d}  {r['pattern'][:40]!r}")
+    print()
+    print("用法：manage.py learn <chat_id> [--run] [--promote] [--limit N]")
 
 
 def cmd_cost(args) -> None:
@@ -305,6 +381,13 @@ def main() -> None:
 
     c = sub.add_parser("list", help="列出所有群")
     c.set_defaults(func=cmd_list)
+
+    i = sub.add_parser("learn", help="自进化：挖候选/看报告/触发毕业")
+    i.add_argument("chat_id", type=int)
+    i.add_argument("--run", action="store_true", help="立即执行一轮挖掘与毕业")
+    i.add_argument("--promote", action="store_true", help="只执行毕业检查")
+    i.add_argument("--limit", type=int, default=3, help="本轮最多毕业条数")
+    i.set_defaults(func=cmd_learn)
 
     h = sub.add_parser("cost", help="成本报告（观察真实日消费）")
     h.add_argument("--days", type=int, default=7)

@@ -1356,6 +1356,43 @@ async def job_refresh_admins(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _learn_managed_links(context.application, cid)
 
 
+async def job_self_evolve(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """自进化：挖候选规则 + 检查毕业。
+
+    规则的价值是速度而非省钱（LLM 单次约 0.0005 元），所以目标是让更多
+    广告在 0ms 内被删掉。毕业闸门是"负样本零命中"——候选必须在全部正常
+    消息语料上零命中才有资格直拦，这比准确率门槛硬得多，也是 V1 栽跟头
+    的地方（它用"命中 3 次 + 100% 准确"，结果 224 条通用词规则变静默秒删）。
+    """
+    if not _manager:
+        return
+    from learner import run_lifecycle
+    from detector_rules import load_patterns
+
+    total_promoted = []
+    for r in await asyncio.to_thread(db.list_active_chats):
+        cid = r["chat_id"]
+        try:
+            st = await asyncio.to_thread(run_lifecycle, cid)
+            if st.get("promoted"):
+                total_promoted += [(cid, p) for p in st["promoted"]]
+                logger.warning("自进化毕业 chat=%s: %s", cid, st["promoted"])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("自进化失败 chat=%s: %s", cid, exc)
+
+    if total_promoted:
+        # 规则库变了，强制重载让 L0 立刻用上
+        await asyncio.to_thread(load_patterns, True)
+        lines = [f"🧬 自进化：新毕业 {len(total_promoted)} 条直拦规则"]
+        for cid, pat in total_promoted[:10]:
+            row = await asyncio.to_thread(db.get_chat, cid)
+            name = (row["title"] if row else "") or cid
+            lines.append(f"• [{str(name)[:12]}] {pat[:40]}")
+        lines.append("\n这些规则已通过「负样本零命中」闸门，现在 0ms 直接删除。")
+        lines.append("查看：manage.py learn <chat_id>")
+        await _send_admin(context.bot, "\n".join(lines))
+
+
 async def job_backfill(context: ContextTypes.DEFAULT_TYPE) -> None:
     """定时回捞未检测消息。
 
@@ -1592,6 +1629,8 @@ def main() -> None:
         jq.run_repeating(job_refresh_admins, interval=3600, first=30)
         # 回捞补判：每 10 分钟检查一次未检测消息
         jq.run_repeating(job_backfill, interval=600, first=60)
+        # 自进化：每天 04:00 挖候选与检查毕业（避开流量高峰）
+        jq.run_daily(job_self_evolve, time=dtime(hour=4, minute=0, tzinfo=TZ))
         jq.run_daily(job_cleanup, time=dtime(hour=4, minute=30, tzinfo=TZ))
         jq.run_daily(job_report_board, time=dtime(hour=23, minute=55, tzinfo=TZ))
     else:
