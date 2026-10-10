@@ -583,6 +583,16 @@ def recent_spam_records(chat_id: int, limit: int = 10) -> list[sqlite3.Row]:
                     ORDER BY id DESC LIMIT ?""", (chat_id, limit))
 
 
+def get_spam_record(record_id: int):
+    return query_one("SELECT * FROM spam_records WHERE id=?", (record_id,))
+
+
+def recent_spam_records_all(limit: int = 20) -> list[sqlite3.Row]:
+    """跨群取最近记录，供 /recent 使用。"""
+    return query("""SELECT * FROM spam_records WHERE action='delete'
+                    ORDER BY id DESC LIMIT ?""", (limit,))
+
+
 def count_deleted_since(chat_id: int, hours: int = 24) -> int:
     cutoff = (datetime.now() - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
     row = query_one("""SELECT COUNT(*) n FROM spam_records

@@ -242,6 +242,28 @@ async def main():
     print("  (d) 管理员免检后未检测数=%d (应为 0)" % left)
     assert left == 0, "管理员消息未标记 is_checked"
 
+    print("=== 12. 回归：同批多条删除记录可分别定位（记录 ID 精确）===")
+    cid3 = -300
+    db.register_chat(cid3, "多条测试群", "general", shadow_mode=False)
+    db.set_chat_field(cid3, "shadow_mode", 0)
+    r1 = db.save_spam_record(cid3, 11, "甲", 7001, "甲的内容", 0.9, "llm", "delete")
+    r2 = db.save_spam_record(cid3, 22, "乙", 7002, "乙的内容", 0.9, "llm", "delete")
+    print("  两条记录 ID: %s / %s (应不同)" % (r1, r2))
+    assert r1 != r2, "同批两条应各自有独立记录 ID"
+    a = db.get_spam_record(r1)
+    b = db.get_spam_record(r2)
+    print("  按 ID 取回: %s=%s, %s=%s" % (r1, a["text_snapshot"], r2, b["text_snapshot"]))
+    assert a["text_snapshot"] == "甲的内容" and b["text_snapshot"] == "乙的内容"
+    # 恢复其中一条不应影响另一条
+    db.execute("UPDATE spam_records SET action='revive' WHERE id=?", (r1,))
+    print("  恢复 %s 后: r1.action=%s  r2.action=%s (r2 应仍为 delete)"
+          % (r1, db.get_spam_record(r1)["action"], db.get_spam_record(r2)["action"]))
+    assert db.get_spam_record(r2)["action"] == "delete"
+    # /recent 数据源
+    n = len(db.recent_spam_records_all(10))
+    print("  recent_spam_records_all 可取:", n, "条")
+    assert n >= 1
+
     os.unlink(tmp)
     print("\n全部通过")
 

@@ -329,24 +329,24 @@ def _make_on_log(app: Application):
             title = row["title"] or str(chat_id)
             head = ("👻 影子（未删）" if shadow else "🗑️ 已删除")
             lines = [f"{head} {len(items)} 条 · {html.escape(str(title))}"]
+            kb_rows = []
             for v in items[:15]:
                 m = v.message
+                rec_id = await asyncio.to_thread(
+                    _latest_record_id, chat_id, m.message_id)
                 lines.append(
                     f"\n#{m.message_id} [{v.confidence:.2f}] "
                     f"{html.escape(str(m.full_name)[:20])}"
                     + (f" {m.marker}" if m.marker else "")
                     + f"\n{html.escape((m.text or '')[:200])}"
                 )
+                if rec_id and not shadow:
+                    kb_rows.append([InlineKeyboardButton(
+                        f"↩️ 恢复 {str(m.text or '')[:24]}",
+                        callback_data=f"rev_{rec_id}")])
             if len(items) > 15:
                 lines.append(f"\n…另有 {len(items) - 15} 条")
-            kb = None
-            if items:
-                kb = InlineKeyboardMarkup([[
-                    InlineKeyboardButton("↩️ 误删恢复",
-                                         callback_data=f"revive_{chat_id}_{items[0].message.user_id}"),
-                    InlineKeyboardButton("🚫 拉黑",
-                                         callback_data=f"bl_{chat_id}_{items[0].message.user_id}"),
-                ]])
+            kb = InlineKeyboardMarkup(kb_rows) if kb_rows else None
             try:
                 await app.bot.send_message(
                     chat_id=row["log_channel_id"], text="\n".join(lines),
@@ -375,35 +375,70 @@ def _spam_keyboard(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
+# 一批删除过多时，逐条通知会把私聊刷爆，只对前 N 条发逐条通知，
+# 其余合并成一条摘要。摘要里的条目仍可用 /recent 逐个处理。
+MAX_DETAIL_NOTIFY = 6
+
+
 async def _notify_spam(bot, verdicts: list[Verdict], shadow: bool) -> None:
-    """通知管理员。影子模式标注"未执行"。"""
+    """逐条通知管理员，每条带自己的操作按钮。
+
+    早先是"一批一条通知、一个按钮"，导致同批第二条无法单独恢复——
+    按钮只指向第一项的发布者，且 revive 逻辑按用户找记录而非按消息。
+    现在改为每条独立通知 + 按记录 ID 精确操作。
+    """
     if not ADMIN_ID or not verdicts:
         return
-    by_chat: dict[int, list[Verdict]] = {}
-    for v in verdicts:
-        by_chat.setdefault(v.message.chat_id, []).append(v)
 
-    for chat_id, items in by_chat.items():
-        row = await asyncio.to_thread(db.get_chat, chat_id)
-        title = (row["title"] if row else str(chat_id)) or str(chat_id)
-        head = (f"👻 影子模式：本应删除 {len(items)} 条（未执行）" if shadow
-                else f"🗑️ 已删除 {len(items)} 条广告")
-        lines = [head, f"群：{html.escape(str(title))}", ""]
-        for v in items[:10]:
-            m = v.message
-            mark = m.marker or "—"
-            lines.append(
-                f"• {html.escape(str(m.full_name)[:18])} {mark} "
-                f"[{v.confidence:.2f}] {html.escape((m.text or '')[:60])}"
-            )
-        if len(items) > 10:
-            lines.append(f"…另有 {len(items) - 10} 条")
+    head = "👻 影子（未执行）" if shadow else "🗑️ 已删除"
+    detail, rest = verdicts[:MAX_DETAIL_NOTIFY], verdicts[MAX_DETAIL_NOTIFY:]
 
+    for v in detail:
+        m = v.message
+        row = await asyncio.to_thread(db.get_chat, m.chat_id)
+        title = (row["title"] if row else str(m.chat_id)) or str(m.chat_id)
+        # 取刚写入的记录 ID，用于精确恢复
+        rec_id = await asyncio.to_thread(_latest_record_id, m.chat_id, m.message_id)
+        text = (
+            f"{head}\n"
+            f"群：{html.escape(str(title))}\n"
+            f"用户：{html.escape(str(m.full_name)[:24])}"
+            + (f" {m.marker}" if m.marker else "") + "\n"
+            f"置信度：{v.confidence:.2f}\n"
+            f"内容：{html.escape((m.text or '')[:120])}"
+        )
         kb = None
-        if not shadow and items:
-            kb = _spam_keyboard(chat_id, items[0].message.user_id)
-        await _send_admin(bot, "\n".join(lines), reply_markup=kb,
+        if not shadow and rec_id:
+            # 按**记录 ID** 操作，而不是按用户——同批多条时才能各自区分
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("↩️ 误删恢复", callback_data=f"rev_{rec_id}"),
+                InlineKeyboardButton("🚫 拉黑此人", callback_data=f"blk_{rec_id}"),
+            ]])
+        await _send_admin(bot, text, reply_markup=kb,
                           disable_web_page_preview=True)
+
+    if rest:
+        by_chat: dict[int, list[Verdict]] = {}
+        for v in rest:
+            by_chat.setdefault(v.message.chat_id, []).append(v)
+        lines = [f"{head} 另有 {len(rest)} 条（未逐条通知）"]
+        for chat_id, items in by_chat.items():
+            row = await asyncio.to_thread(db.get_chat, chat_id)
+            title = (row["title"] if row else str(chat_id)) or str(chat_id)
+            lines.append(f"\n【{html.escape(str(title))}】")
+            for v in items[:8]:
+                lines.append(f"• [{v.confidence:.2f}] "
+                             f"{html.escape((v.message.text or '')[:44])}")
+        lines.append("\n用 /recent 查看并逐条恢复。")
+        await _send_admin(bot, "\n".join(lines), disable_web_page_preview=True)
+
+
+def _latest_record_id(chat_id: int, message_id: int) -> int | None:
+    """取某条消息最近一次删除记录的 ID。"""
+    row = db.query_one("""SELECT id FROM spam_records
+                          WHERE chat_id=? AND message_id=? AND action='delete'
+                          ORDER BY id DESC LIMIT 1""", (chat_id, message_id))
+    return row["id"] if row else None
 
 
 # 自动注册时使用的默认值。
@@ -841,6 +876,89 @@ async def cmd_logchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await msg.reply_text(f"✅ 已把 {len(chats)} 个群的删除记录指向频道 {cid}")
 
 
+async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """列出最近删除记录，每条带独立恢复按钮。
+
+    存在的理由：一批删除超过 MAX_DETAIL_NOTIFY 条时，多出的部分只发摘要，
+    没有按钮。这个命令是那些条目的补漏入口。
+    """
+    if not _is_admin_user(update.effective_user.id if update.effective_user else None):
+        return
+    msg = update.effective_message
+    if not msg:
+        return
+    limit = 10
+    if context.args and context.args[0].isdigit():
+        limit = max(1, min(30, int(context.args[0])))
+
+    recs = await asyncio.to_thread(db.recent_spam_records_all, limit)
+    if not recs:
+        await msg.reply_text("暂无删除记录。")
+        return
+
+    chats = {c["chat_id"]: (c["title"] or str(c["chat_id"]))
+             for c in await asyncio.to_thread(db.list_active_chats)}
+    lines = [f"📜 最近 {len(recs)} 条删除记录", ""]
+    kb_rows = []
+    for r in recs:
+        title = chats.get(r["chat_id"], str(r["chat_id"]))
+        conf = r["confidence"] or 0
+        lines.append(
+            f"#{r['id']} [{conf:.2f}] {title}\n"
+            f"   {str(r['full_name'] or r['user_id'])[:20]}: "
+            f"{str(r['text_snapshot'] or '')[:52]}"
+        )
+        kb_rows.append([InlineKeyboardButton(
+            f"↩️ 恢复 #{r['id']}", callback_data=f"rev_{r['id']}")])
+
+    text = "\n".join(lines)
+    if len(text) > 3800:
+        text = text[:3800] + "\n…（已截断，用 /recent <数量> 调整）"
+    await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb_rows),
+                         disable_web_page_preview=True)
+
+
+async def cmd_revive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """按记录 ID 恢复。/revive 123
+
+    消息已被删除无法找回，这个命令的作用是：把该内容记为反例（收紧尺度）
+    + 撤销违规计数。这是比事后翻日志更直接的反馈方式。
+    """
+    if not _is_admin_user(update.effective_user.id if update.effective_user else None):
+        return
+    msg = update.effective_message
+    if not msg:
+        return
+    if not context.args or not context.args[0].isdigit():
+        await msg.reply_text("用法：/revive <记录ID>\n记录 ID 见删除通知或 /recent")
+        return
+    rec_id = int(context.args[0])
+    rec = await asyncio.to_thread(db.get_spam_record, rec_id)
+    if not rec:
+        await msg.reply_text(f"❌ 找不到记录 {rec_id}")
+        return
+    if rec["action"] == "revive":
+        await msg.reply_text(f"ℹ️ 记录 {rec_id} 已经是恢复状态")
+        return
+
+    if rec["text_snapshot"]:
+        await asyncio.to_thread(db.add_fewshot, rec["chat_id"], "negative",
+                                rec["text_snapshot"], "revive")
+    await asyncio.to_thread(db.execute,
+                            "UPDATE spam_records SET action='revive' WHERE id=?",
+                            (rec_id,))
+    await asyncio.to_thread(db.execute,
+                            """UPDATE users SET del_count = MAX(0, del_count - 1)
+                               WHERE chat_id=? AND user_id=?""",
+                            (rec["chat_id"], rec["user_id"]))
+    await msg.reply_text(
+        f"✅ 已恢复记录 {rec_id}\n"
+        f"用户：{rec['full_name'] or rec['user_id']}\n"
+        f"内容：{str(rec['text_snapshot'] or '')[:80]}\n\n"
+        f"该内容已记为反例。消息本身无法找回。"
+    )
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin_user(update.effective_user.id if update.effective_user else None):
         return
@@ -936,26 +1054,57 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await query.edit_message_text("\n".join(lines), reply_markup=_admin_kb())
 
     elif data.startswith("revive_"):
-        _, cid, uid = data.split("_", 2)
-        cid_i, uid_i = int(cid), int(uid)
-        await asyncio.to_thread(db.whitelist_set, cid_i, uid_i, "trusted",
-                                None, query.from_user.id, "误删恢复")
-        # 撤销信号是最有价值的反馈：记为反例，避免同类内容再被误删
-        recs = await asyncio.to_thread(db.recent_spam_records, cid_i, 5)
-        for s in recs:
-            if s["user_id"] == uid_i and s["text_snapshot"]:
-                await asyncio.to_thread(db.add_fewshot, cid_i, "negative",
-                                        s["text_snapshot"], "revive")
-                break
+        # 兼容旧版按钮（revive_{chat}_{user}），新消息用 rev_{record_id}
         await query.edit_message_text(
-            f"✅ 已把 {uid_i} 加入白名单，并把最近一条内容记为反例。")
+            "这条按钮来自旧版通知，无法精确定位。请用 /recent 重新操作。")
 
-    elif data.startswith("bl_"):
-        _, cid, uid = data.split("_", 2)
-        cid_i, uid_i = int(cid), int(uid)
-        await asyncio.to_thread(db.blacklist_add, cid_i, uid_i, None,
+    elif data.startswith("rev_"):
+        # 按记录 ID 恢复：同批多条时能精确区分，且不误伤同一用户的其他消息
+        try:
+            rec_id = int(data.split("_", 1)[1])
+        except (IndexError, ValueError):
+            await query.edit_message_text("❌ 无效的恢复请求")
+            return
+        rec = await asyncio.to_thread(db.get_spam_record, rec_id)
+        if not rec:
+            await query.edit_message_text("❌ 找不到该记录")
+            return
+        uid, cid = rec["user_id"], rec["chat_id"]
+
+        # 1) 该内容记为反例（最有价值的反馈信号）
+        if rec["text_snapshot"]:
+            await asyncio.to_thread(db.add_fewshot, cid, "negative",
+                                    rec["text_snapshot"], "revive")
+        # 2) 把该条记录标记为已恢复
+        await asyncio.to_thread(db.execute,
+                                "UPDATE spam_records SET action='revive' WHERE id=?",
+                                (rec_id,))
+        # 3) 撤销计数（这条本不该算违规）
+        await asyncio.to_thread(db.execute,
+                                """UPDATE users SET del_count = MAX(0, del_count - 1)
+                                   WHERE chat_id=? AND user_id=?""", (cid, uid))
+        await query.edit_message_text(
+            f"✅ 已恢复这条（记录 {rec_id}）\n"
+            f"内容已记为反例，同类判定的尺度会随之收紧。\n"
+            f"用户：{rec['full_name'] or uid}\n\n"
+            f"注意：消息本身已被删除，无法找回；"
+            f"如该用户是长期误删对象，用 /wl 加入白名单。")
+
+    elif data.startswith("blk_"):
+        try:
+            rec_id = int(data.split("_", 1)[1])
+        except (IndexError, ValueError):
+            await query.edit_message_text("❌ 无效请求")
+            return
+        rec = await asyncio.to_thread(db.get_spam_record, rec_id)
+        if not rec:
+            await query.edit_message_text("❌ 找不到该记录")
+            return
+        await asyncio.to_thread(db.blacklist_add, rec["chat_id"],
+                                rec["user_id"], rec["full_name"],
                                 query.from_user.id, "管理员从通知拉黑")
-        await query.edit_message_text(f"🚫 {uid_i} 已拉黑。")
+        await query.edit_message_text(
+            f"🚫 {rec['full_name'] or rec['user_id']} 已拉黑，其消息将被直接删除。")
 
 
 # ---------------------------------------------------------------------------
@@ -1196,6 +1345,8 @@ def main() -> None:
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("logchannel", cmd_logchannel))
+    app.add_handler(CommandHandler("recent", cmd_recent))
+    app.add_handler(CommandHandler("revive", cmd_revive))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
