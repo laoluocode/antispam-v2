@@ -1,0 +1,116 @@
+"""L0 确定性规则。
+
+设计原则：**只放零误伤的模式**。
+
+V1 的教训是把 150 行"群内黑话"硬编码进正则（`尚门`、`大一外出`、`特jia` …），
+结果是规则跟广告号的措辞赛跑，且一旦命中就绕过了所有 AI 兜底与人工复核。
+V2 里这类"像广告的词"一律降到 few-shot 例子，交给模型判断；
+L0 只保留三类**确定性事实**：
+
+1. 联系方式本体（手机号、t.me、@bot）—— 正常群友不会发这些
+2. 广告号混淆手法（不可见字符高占比）—— 正常群友不会打出变体选择符
+3. 黑名单用户 —— 人工或学习层确认过的账号
+
+命中 L0 直接删除，不进 LLM，延迟 ~0ms、成本 0。
+"""
+
+import re
+from typing import NamedTuple
+
+from utils.normalize import invisible_ratio, normalize
+
+# 中国大陆手机号：正常聊天不会出现（群里没人报手机号）
+PHONE_PATTERN = re.compile(r"(?:\+?86[-\s]?)?1[3-9]\d{9}")
+
+# Telegram 引流链接
+TELEGRAM_LINK_PATTERN = re.compile(
+    r"(?:t\.me/|telegram\.me/|@[A-Za-z][A-Za-z0-9_]{4,31}bot\b)",
+    re.IGNORECASE,
+)
+
+# 银行卡号（16-19 位连续数字，且不是手机号）
+BANK_CARD_PATTERN = re.compile(r"\b\d{16,19}\b")
+
+# 不可见字符占比阈值。
+# 实测：正常群聊消息为 0%，广告号混淆消息可达 20-40%。
+# 取 15% 留足余量，且要求消息足够长以免短消息被单个字符拉高占比。
+INVISIBLE_RATIO_THRESHOLD = 0.15
+INVISIBLE_MIN_LENGTH = 10
+
+
+class Verdict(NamedTuple):
+    """L0 判定结果。hit=False 时 reason 为空。"""
+
+    hit: bool
+    reason: str
+
+
+_NO_HIT = Verdict(False, "")
+
+
+def check_local(text: str, user_id: int, chat_id: int, blacklist_ids: set) -> Verdict:
+    """L0 检查。任何一项命中即返回删除判定。
+
+    注意：这里刻意不做"广告词匹配"。像 `上门`、`约课`、`养生` 这类词
+    在本群是正常话题（V1 因移除 `开课` 关键词有过专门的修复提交），
+    必须交给模型结合上下文判断。
+    """
+    t = text or ""
+    if not t.strip():
+        return _NO_HIT
+
+    # 1. 黑名单用户：不看内容，直接删
+    if user_id in blacklist_ids:
+        return Verdict(True, "黑名单用户")
+
+    # 2. 不可见字符混淆：正常输入不会产生变体选择符
+    if len(t) >= INVISIBLE_MIN_LENGTH and invisible_ratio(t) >= INVISIBLE_RATIO_THRESHOLD:
+        ratio = invisible_ratio(t)
+        return Verdict(True, f"不可见字符混淆（占比 {ratio:.0%}）")
+
+    # 3. 手机号
+    if PHONE_PATTERN.search(t):
+        return Verdict(True, "包含手机号")
+
+    # 4. Telegram 引流链接
+    if TELEGRAM_LINK_PATTERN.search(t):
+        return Verdict(True, "包含 Telegram 引流链接")
+
+    # 5. 银行卡号（先排除已被手机号规则覆盖的情况）
+    if not PHONE_PATTERN.search(t) and BANK_CARD_PATTERN.search(t):
+        return Verdict(True, "包含银行卡号")
+
+    return _NO_HIT
+
+
+def signature(text: str) -> str:
+    """消息指纹，用于重复刷屏检测。
+
+    归一化后比对，使 `个人外出` 与 `個 人 外 出` 视为同一条，
+    但保留长度信息以免不同消息归一化后碰撞。
+    """
+    return normalize(text)
+
+
+if __name__ == "__main__":
+    samples = [
+        ("能收🧧就行，曰5K", 1, "普通"),
+        ("我的电话是13812345678，有事联系", 2, "含手机号"),
+        ("加我 t.me/someone 详聊", 3, "含tg链接"),
+        ("个人外出 無定面付 详情dd", 4, "黑话但无确定性特征"),
+        ("今天在汉口那边修的车，体验还行", 5, "正常"),
+        ("卡号 6222021234567890123 打款", 6, "含银行卡"),
+        ("@some_spam_bot 点我", 7, "bot链接"),
+        ("约课吗 有空", 8, "正常话题词"),
+    ]
+    bl = {99}
+    print(f"{'结果':6s} {'原因':24s} 样本")
+    print("-" * 78)
+    for text, uid, label in samples:
+        v = check_local(text, uid, -100, bl)
+        status = "命中" if v.hit else "放行"
+        print(f"{status:6s} {v.reason:24s} [{label}] {text}")
+    print()
+    print("黑名单用户测试:")
+    v = check_local("今天天气不错", 99, -100, bl)
+    print(f"  {v.hit} {v.reason}")
