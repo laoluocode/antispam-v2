@@ -61,6 +61,21 @@ ADVERTISER_CUT = 0.85
 PROFILE_TTL = 30.0
 ADMIN_TTL = 300.0
 
+# 最小批大小门槛。**这是每调用成本的关键。**
+#
+# 实测问题（2026-10-10，上线 8 小时）：平均批大小只有 2.0 条，而每次调用
+# 要重发约 1,685 token 的稳定前缀 —— 单次调用 2,079 token 里 81% 是固定开销。
+# 结果 300k 的日预算只够 144 次调用，下午 4-5 点就把预算烧光，
+# 后半天的消息全部没判定。
+#
+# 修法：队列里消息不够就不急着发，等攒够或超时。
+# 好处是自适应——忙群几分钟就攒够，闲群走超时，不需要按群调参。
+#
+# 计算：20 条一批时，前缀只占 1,685/(1,685+20*9+25) ≈ 89%... 不对，
+# 是前缀的**单条摊薄**从 842 token/条 降到 84 token/条，降低 10 倍。
+MIN_BATCH_FAST = 20
+MIN_BATCH_SLOW = 40
+
 # 协同刷屏阈值：同一预览目标在 24h 内被多少个不同账号引用。
 # 实测案例：两个账号交叉发单字母，指向同一个频道预览。
 # 正常群友分享同一链接的账号数远低于此。
@@ -277,6 +292,33 @@ class ChatPipeline:
             (self._fast if msg.fast else self._slow).append(msg)
         return None
 
+    async def enqueue_backlog(self, limit: int = 200) -> int:
+        """把库里未检测的消息回捞进队列。
+
+        为什么需要：流水线只处理 submit() 推进来的实时消息。一旦出现
+        "消息已标记 is_checked=1 但没过 LLM"（例如早先预算超限时被直接丢弃），
+        它们既不在队列里、也不会被重新取——永久静默丢失。
+        这个方法提供补判入口，也让运维可以手工回捞历史消息。
+
+        返回实际入队的条数。
+        """
+        rows = await asyncio.to_thread(db.take_unchecked_batch, self.chat_id, limit)
+        if not rows:
+            return 0
+        for r in rows:
+            msg = PendingMessage(
+                row_id=r["id"], message_id=r["message_id"], chat_id=r["chat_id"],
+                user_id=r["user_id"], full_name=r["full_name"] or "",
+                text=r["text"] or "", reply_to=r["reply_to"],
+                timestamp=str(r["timestamp"] or ""),
+            )
+            # 补判走常规队列：这些是历史消息，不需要抢实时性
+            async with self._lock:
+                self._slow.append(msg)
+        logger.info("chat=%s 回捞 %d 条未检测消息进入补判队列",
+                    self.chat_id, len(rows))
+        return len(rows)
+
     # -- 攒批循环 ---------------------------------------------------------
 
     async def run(self, stop: asyncio.Event) -> None:
@@ -290,36 +332,28 @@ class ChatPipeline:
 
         while not stop.is_set():
             now = time.time()
-            due_fast = now >= fast_deadline
-            due_slow = now >= slow_deadline
+            async with self._lock:
+                n_fast, n_slow = len(self._fast), len(self._slow)
 
-            if due_fast or due_slow:
+            # 触发条件：攒够最小批 或 到时间窗。
+            # 攒够优先——忙群几分钟就够一批，闲群走超时，自适应无需按群调参。
+            fire_fast = n_fast >= MIN_BATCH_FAST or (now >= fast_deadline and n_fast)
+            fire_slow = n_slow >= MIN_BATCH_SLOW or (now >= slow_deadline and n_slow)
+
+            if fire_fast or fire_slow:
                 batch: list[PendingMessage] = []
                 async with self._lock:
-                    if due_fast and self._fast:
+                    if fire_fast:
                         batch += list(self._fast)
                         self._fast.clear()
-                    if due_slow and self._slow:
+                    if fire_slow:
                         batch += list(self._slow)
                         self._slow.clear()
                 if batch:
                     await self._judge(batch)
-                if due_fast:
+                if fire_fast:
                     fast_deadline = time.time() + fast_win
-                if due_slow:
-                    slow_deadline = time.time() + slow_win
-                    # 顺带把慢队列里积压过多的部分也发了
-            else:
-                # 慢队列攒够上限也提前发，避免稀疏群等太久
-                async with self._lock:
-                    overflow = len(self._slow) >= int(cfg.get("batch_max", 100))
-                if overflow:
-                    batch = []
-                    async with self._lock:
-                        batch = list(self._slow)
-                        self._slow.clear()
-                    if batch:
-                        await self._judge(batch)
+                if fire_slow:
                     slow_deadline = time.time() + slow_win
 
             try:
@@ -334,12 +368,21 @@ class ChatPipeline:
         if not cfg:
             return
 
-        # 预算护栏：超限时本轮降级，只保留 L0 结果，
-        # 消息留待下轮（take_unchecked_batch 已标记，故这里直接丢弃并告警）
+        # 预算护栏。
+        # ⚠️ 早先的实现在这里直接 return，而这些消息**已经被标记 is_checked=1**
+        # 且不会重试 —— 等于永久静默丢失。实测线上有 2,370 条消息是这样被吞掉的，
+        # 其中混着真广告。现在改为：回队 + 告警（有重试上限兜底，不会无限堆积）。
         used = await asyncio.to_thread(db.tokens_used_today, self.chat_id)
-        if used >= int(cfg.get("daily_token_cap", 300000)):
-            logger.warning("chat=%s 已达每日 token 预算 %s，跳过本轮判定",
-                           self.chat_id, used)
+        cap = int(cfg.get("daily_token_cap", 2000000))
+        if used >= cap:
+            keep = await asyncio.to_thread(
+                db.bump_retry, [m.row_id for m in batch])
+            logger.warning(
+                "chat=%s 已达每日 token 预算 %s/%s，本批 %d 条回队（%d 条将继续重试）",
+                self.chat_id, used, cap, len(batch), len(keep))
+            if keep:
+                await asyncio.to_thread(
+                    self._requeue, [m for m in batch if m.row_id in set(keep)])
             return
 
         messages = self._build_prompt(batch)

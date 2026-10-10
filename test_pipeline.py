@@ -398,6 +398,58 @@ async def main():
     db.global_blacklist_remove(999888)
     print("      移除后 B群可见:", db.blacklist_ids(cid6))
 
+    print("=== 16. 回归：最小批门槛 / 预算超限回队 / 回捞补判 ===")
+    import pipeline as _pl
+
+    print("  最小批门槛: fast=%d slow=%d" % (_pl.MIN_BATCH_FAST, _pl.MIN_BATCH_SLOW))
+    assert _pl.MIN_BATCH_FAST >= 10 and _pl.MIN_BATCH_SLOW >= 10, "门槛过小起不到摊薄作用"
+
+    cid7 = -800
+    db.register_chat(cid7, "回捞测试群", "general", shadow_mode=False)
+    db.set_chat_field(cid7, "shadow_mode", 0)
+    for i in range(5):
+        db.save_message(cid7, 9500 + i, 3, "群友", "内容 %d" % i, None, "t")
+        db.take_unchecked_batch(cid7, 1)   # 假装判过（模拟早先被静默丢弃）
+
+    left = db.query("SELECT COUNT(*) n FROM messages WHERE chat_id=? AND is_checked=0",
+                    (cid7,))[0]["n"]
+    print("  造 5 条『已标记检测但没判过』的消息，未检测=%d" % left)
+
+    # 手工把它们置回未检测，模拟需要补判的状态
+    db.execute("UPDATE messages SET is_checked=0 WHERE chat_id=?", (cid7,))
+    p16 = ChatPipeline(cid7, fake, noop, None)
+    n = await p16.enqueue_backlog(100)
+    print("  enqueue_backlog 入队 %d 条" % n)
+    assert n == 5, "应回捞 5 条"
+    print("  队列: fast=%d slow=%d（补判应进 slow）"
+          % (len(p16._fast), len(p16._slow)))
+    assert len(p16._slow) == 5 and len(p16._fast) == 0
+    after = db.query("SELECT COUNT(*) n FROM messages WHERE chat_id=? AND is_checked=0",
+                     (cid7,))[0]["n"]
+    print("  回捞后未检测=%d（应为 0，已标记进队列）" % after)
+    assert after == 0
+
+    # 预算超限时应回队而不是丢弃。
+    # 注意必须先产生用量记录，否则 used=0 而 cap=1 时 0>=1 为假，护栏不会触发
+    #（第一版测试就栽在这里——它测的是"没超预算"，不是"超预算"）。
+    db.record_usage(cid7, 1, 5000, 500, 200, 0.01)
+    db.set_chat_field(cid7, "daily_token_cap", 1)
+    db.save_message(cid7, 9600, 3, "群友", "预算测试", None, "t")
+    rows = db.take_unchecked_batch(cid7, 10)
+    batch = [PendingMessage(r["id"], r["message_id"], cid7, 3, "群友",
+                            r["text"], None, "t") for r in rows]
+    before_calls = fake.calls
+    print("      已用量=%s 上限=%s -> 应触发护栏"
+          % (db.tokens_used_today(cid7), db.get_chat(cid7)["daily_token_cap"]))
+    p17 = ChatPipeline(cid7, fake, noop, None)
+    await p17._judge(batch)
+    stayed = db.query("SELECT COUNT(*) n FROM messages WHERE chat_id=? AND is_checked=0",
+                      (cid7,))[0]["n"]
+    print("  预算超限: 是否跳过 LLM 调用=%s, 回队后未检测=%d（应 >0，不再静默丢弃）"
+          % (fake.calls == before_calls, stayed))
+    assert fake.calls == before_calls, "超预算不应调用 LLM"
+    assert stayed > 0, "超预算应回队而非永久丢弃"
+
     os.unlink(tmp)
     print("\n全部通过")
 

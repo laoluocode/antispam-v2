@@ -1356,6 +1356,26 @@ async def job_refresh_admins(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _learn_managed_links(context.application, cid)
 
 
+async def job_backfill(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """定时回捞未检测消息。
+
+    兜底机制：正常情况下 submit() 会把消息推进队列，但预算超限、进程重启、
+    或早先版本的静默丢弃都会留下"已标记检测但没过 LLM"的消息。
+    这个任务定期把它们捞回来补判，避免永久丢失。
+    """
+    if not _manager:
+        return
+    total = 0
+    for cid, p in list(_manager._pipelines.items()):  # noqa: SLF001
+        try:
+            n = await p.enqueue_backlog(300)
+            total += n
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("回捞失败 chat=%s: %s", cid, exc)
+    if total:
+        logger.info("回捞补判：共 %d 条未检测消息入队", total)
+
+
 async def job_heartbeat_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     """自检：判定连续失败时告警，避免静默失效。"""
     if not ADMIN_ID or not _manager:
@@ -1570,6 +1590,8 @@ def main() -> None:
         jq.run_repeating(job_keepalive, interval=60, first=5)
         jq.run_repeating(job_heartbeat_check, interval=300, first=120)
         jq.run_repeating(job_refresh_admins, interval=3600, first=30)
+        # 回捞补判：每 10 分钟检查一次未检测消息
+        jq.run_repeating(job_backfill, interval=600, first=60)
         jq.run_daily(job_cleanup, time=dtime(hour=4, minute=30, tzinfo=TZ))
         jq.run_daily(job_report_board, time=dtime(hour=23, minute=55, tzinfo=TZ))
     else:

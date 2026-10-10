@@ -58,7 +58,12 @@ CREATE TABLE IF NOT EXISTS chats (
     batch_seconds    INTEGER DEFAULT 90,          -- L2 常规攒批窗口
     batch_max        INTEGER DEFAULT 50,          -- L2 单批上限（也是攒够即发的阈值）
                                                   -- 设太大在稀疏群会导致攒不满就等满窗口
-    daily_token_cap  INTEGER DEFAULT 300000,      -- 每群每日 token 预算
+    daily_token_cap  INTEGER DEFAULT 3000000,     -- 每群每日 token 预算
+                                                  -- 实测校准：原先 300k 只够 144 次调用
+                                                  -- （平均批仅 2 条），下午就烧光。
+                                                  -- 配合最小批门槛（20 条）后单次成本
+                                                  -- 摊薄 10 倍，3M 可覆盖高流量群全天。
+                                                  -- 费用量级：约 0.2-1 元/天/群
     report_limit     INTEGER DEFAULT 20,          -- 每人每日举报额度
     log_channel_id   INTEGER,                     -- 删除记录频道（0/NULL=不发）
     managed_links    TEXT,                        -- 本群体系的频道标识（逗号分隔）
