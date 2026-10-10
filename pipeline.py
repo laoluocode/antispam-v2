@@ -1,0 +1,428 @@
+"""检测流水线：攒批、分级路由、判定执行。
+
+三层响应速度，按用户风险分流（这是"露头秒"的关键，判定器本身快慢无关紧要）：
+
+| 层 | 响应 | 成本 | 覆盖 |
+|---|---|---|---|
+| L0 确定性规则 | ~0ms | 0 | 不可见字符混淆、手机号、t.me、黑名单、重复刷屏 |
+| L1 快车道 | ~15s | 低 | 新人 / 惯犯 / 高风险用户的消息 |
+| L2 常规 | ~90s | 极低 | 其余流量 |
+
+**为什么按用户风险分流而不是全部实时**：真正会秒发秒撤的是垃圾号，而垃圾号的
+特征就是"新"或"惯犯"。老用户偶尔发广告不会盯着屏幕秒撤。
+所以 L1 只覆盖高风险流量，却抓住了绝大多数需要秒删的消息。
+
+**成本为什么可以接受**：稳定前缀命中缓存后，小请求的边际成本几乎为零。
+实测一次调用 3,214 miss + 42,621 hit token；单条实时只是在未命中部分加了
+约 40 token。所以"每条实时"约 7 元/月，"按 50 条攒批"约 4 元/月——差距很小，
+不是此前设想的 50 倍。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import time
+from collections import deque
+from dataclasses import dataclass, field
+
+import db
+from deepseek import DeepSeekClient, DeepSeekError, estimate_cost_yuan
+from detector_rules import (
+    INVISIBLE_MIN_LENGTH,
+    INVISIBLE_RATIO_THRESHOLD,
+    check_local,
+    check_repeat,
+    compute_trust,
+    trust_marker,
+)
+from prompts import BATCH_INSTRUCTION, GLOBAL_PROMPT, build_fewshots, build_group_profile
+from utils.normalize import invisible_ratio
+
+logger = logging.getLogger(__name__)
+
+# L1 快车道触发条件：这些用户的消息优先送判定
+FASTLANE_TRUST_LEVELS = {"new", "repeat"}
+
+# 重复检测看多少条近期消息
+REPEAT_WINDOW = 8
+REPEAT_THRESHOLD = 3
+
+# 付费商家（advertiser 档）判定为删除所需的最低置信度。
+# 他们付了钱，招揽性质的广告应放过；但诈骗/黑产/外部产品推销照样要删，
+# 否则白名单就变成了投毒通道。取 0.85 与严格档的"铁证"线对齐。
+ADVERTISER_CUT = 0.85
+
+# 数据库查询的短 TTL 缓存。避免每条消息都打一次库。
+PROFILE_TTL = 30.0
+ADMIN_TTL = 300.0
+
+
+@dataclass
+class PendingMessage:
+    """一条待判定的消息。"""
+
+    row_id: int
+    message_id: int
+    chat_id: int
+    user_id: int
+    full_name: str
+    text: str
+    reply_to: int | None
+    timestamp: str
+
+    # 判定前算好的信号
+    trust: str = "normal"
+    history: list[str] = field(default_factory=list)
+    fast: bool = False
+    whitelist: str = ""      # "" | "advertiser"（trusted 的消息不会入队）
+
+    @property
+    def marker(self) -> str:
+        return trust_marker(self.trust)
+
+
+@dataclass
+class Verdict:
+    """判定结果。"""
+
+    message: PendingMessage
+    is_spam: bool
+    confidence: float
+    source: str
+    reason: str = ""
+
+
+class ChatPipeline:
+    """单个群的检测流水线。每个群一个实例，互不干扰。"""
+
+    def __init__(self, chat_id: int, client: DeepSeekClient,
+                 on_spam, notify=None) -> None:
+        self.chat_id = chat_id
+        self.client = client
+        self.on_spam = on_spam          # async (Verdict) -> None，由 main 注入执行删除
+        self.notify = notify            # async (list[Verdict]) -> None，通知管理员
+        self._fast: deque[PendingMessage] = deque()
+        self._slow: deque[PendingMessage] = deque()
+        self._lock = asyncio.Lock()
+        self._profile_cache: dict[int, tuple[float, dict, str]] = {}
+        self._history_cache: dict[int, tuple[float, list[str]]] = {}
+        self._admin_cache: tuple[float, set[int]] = (0.0, set())
+        self.last_error: str | None = None
+
+    # -- 配置读取 ---------------------------------------------------------
+
+    def _cfg(self) -> dict:
+        row = db.get_chat(self.chat_id)
+        if not row:
+            return {
+                "strictness": "strict", "confidence_cut": 0.5, "shadow_mode": 1,
+                "fastlane_seconds": 15, "batch_seconds": 90, "batch_max": 100,
+                "daily_token_cap": 300000, "chat_nature": "general",
+                "notify_admin": 1, "title": "",
+            }
+        return dict(row)
+
+    # -- 用户信号 ---------------------------------------------------------
+
+    async def _profile(self, user_id: int, full_name: str) -> tuple[dict, str]:
+        """取 (用户统计, 信任档位)。带 TTL 缓存。"""
+        now = time.time()
+        cached = self._profile_cache.get(user_id)
+        if cached and cached[0] > now:
+            return cached[1], cached[2]
+        stats = await asyncio.to_thread(db.user_stats, self.chat_id, user_id)
+        trust = compute_trust(stats["msg_n"], stats["del_n"], stats["span_days"])
+        self._profile_cache[user_id] = (now + PROFILE_TTL, stats, trust)
+        return stats, trust
+
+    async def _history(self, user_id: int) -> list[str]:
+        now = time.time()
+        cached = self._history_cache.get(user_id)
+        if cached and cached[0] > now:
+            return cached[1]
+        texts = await asyncio.to_thread(
+            db.recent_user_texts, self.chat_id, user_id, REPEAT_WINDOW
+        )
+        self._history_cache[user_id] = (now + PROFILE_TTL, texts)
+        return texts
+
+    async def _is_admin(self, user_id: int) -> bool:
+        now = time.time()
+        if self._admin_cache[0] > now:
+            return user_id in self._admin_cache[1]
+        ids = await asyncio.to_thread(db.cached_admin_ids, self.chat_id)
+        self._admin_cache = (now + ADMIN_TTL, ids)
+        return user_id in ids
+
+    # -- 入口：消息到达 ---------------------------------------------------
+
+    async def submit(self, msg: PendingMessage) -> Verdict | None:
+        """处理一条消息。返回 L0 立即判定结果，或 None（已入队等 LLM）。"""
+        cfg = self._cfg()
+        if not cfg:
+            return None
+
+        # 管理员免检
+        if await self._is_admin(msg.user_id):
+            logger.debug("跳过管理员 chat=%s user=%s", self.chat_id, msg.user_id)
+            return None
+
+        stats, trust = await self._profile(msg.user_id, msg.full_name)
+        msg.trust = trust
+
+        # 白名单：trusted 完全跳过，advertiser 只删高置信
+        level = await asyncio.to_thread(db.whitelist_level, self.chat_id, msg.user_id)
+        if level == "trusted":
+            logger.info("白名单(trusted)跳过 chat=%s user=%s", self.chat_id, msg.user_id)
+            return None
+        msg.whitelist = level or ""
+
+        # --- L0 确定性规则 ---
+        blacklist = await asyncio.to_thread(db.blacklist_ids, self.chat_id)
+        v = check_local(msg.text, msg.user_id, self.chat_id, blacklist)
+        if not v.hit:
+            # 重复刷屏需要近期发言
+            history = await self._history(msg.user_id)
+            if history:
+                v = check_repeat(msg.text, history, REPEAT_THRESHOLD)
+
+        if v.hit:
+            return Verdict(msg, True, 1.0, "local_rule", v.reason)
+
+        # --- 分流 ---
+        cut = cfg["confidence_cut"]
+        # 不可见字符占比高：广告号的强特征，插队到快车道
+        suspicious = (len(msg.text) >= INVISIBLE_MIN_LENGTH
+                      and invisible_ratio(msg.text) >= INVISIBLE_RATIO_THRESHOLD)
+        msg.fast = trust in FASTLANE_TRUST_LEVELS or suspicious
+        if level == "advertiser":
+            msg.fast = False  # 付费商家不抢快车道资源
+
+        msg.history = (await self._history(msg.user_id))[:5]
+
+        async with self._lock:
+            (self._fast if msg.fast else self._slow).append(msg)
+        return None
+
+    # -- 攒批循环 ---------------------------------------------------------
+
+    async def run(self, stop: asyncio.Event) -> None:
+        """常驻循环：分别按各自的窗口排空两个队列。"""
+        cfg = self._cfg()
+        fast_win = max(3, int(cfg.get("fastlane_seconds", 15)))
+        slow_win = max(10, int(cfg.get("batch_seconds", 90)))
+
+        fast_deadline = time.time() + fast_win
+        slow_deadline = time.time() + slow_win
+
+        while not stop.is_set():
+            now = time.time()
+            due_fast = now >= fast_deadline
+            due_slow = now >= slow_deadline
+
+            if due_fast or due_slow:
+                batch: list[PendingMessage] = []
+                async with self._lock:
+                    if due_fast and self._fast:
+                        batch += list(self._fast)
+                        self._fast.clear()
+                    if due_slow and self._slow:
+                        batch += list(self._slow)
+                        self._slow.clear()
+                if batch:
+                    await self._judge(batch)
+                if due_fast:
+                    fast_deadline = time.time() + fast_win
+                if due_slow:
+                    slow_deadline = time.time() + slow_win
+                    # 顺带把慢队列里积压过多的部分也发了
+            else:
+                # 慢队列攒够上限也提前发，避免稀疏群等太久
+                async with self._lock:
+                    overflow = len(self._slow) >= int(cfg.get("batch_max", 100))
+                if overflow:
+                    batch = []
+                    async with self._lock:
+                        batch = list(self._slow)
+                        self._slow.clear()
+                    if batch:
+                        await self._judge(batch)
+                    slow_deadline = time.time() + slow_win
+
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=1.0)
+            except asyncio.TimeoutError:
+                pass
+
+    # -- 判定 -------------------------------------------------------------
+
+    async def _judge(self, batch: list[PendingMessage]) -> None:
+        cfg = self._cfg()
+        if not cfg:
+            return
+
+        # 预算护栏：超限时本轮降级，只保留 L0 结果，
+        # 消息留待下轮（take_unchecked_batch 已标记，故这里直接丢弃并告警）
+        used = await asyncio.to_thread(db.tokens_used_today, self.chat_id)
+        if used >= int(cfg.get("daily_token_cap", 300000)):
+            logger.warning("chat=%s 已达每日 token 预算 %s，跳过本轮判定",
+                           self.chat_id, used)
+            return
+
+        messages = self._build_prompt(batch)
+        try:
+            parsed, usage = await self.client.judge(
+                messages, user_id=f"chat_{self.chat_id}"
+            )
+        except DeepSeekError as exc:
+            self.last_error = str(exc)
+            logger.error("chat=%s 判定失败，本批 %d 条留待重试: %s",
+                         self.chat_id, len(batch), exc)
+            # 回队重试：清掉 is_checked 让它们下轮重新取
+            await asyncio.to_thread(self._requeue, batch)
+            return
+
+        cost = estimate_cost_yuan(usage, peak=True)
+        await asyncio.to_thread(
+            db.record_usage, self.chat_id, usage.calls,
+            usage.cache_hit_tokens, usage.cache_miss_tokens,
+            usage.completion_tokens, cost,
+        )
+        logger.info(
+            "chat=%s 判定 %d 条：缓存命中 %.0f%%，成本 %.6f 元",
+            self.chat_id, len(batch), usage.cache_hit_rate * 100, cost,
+        )
+
+        scores = {int(v["id"]): float(v.get("confidence", 0.0))
+                  for v in parsed.get("verdicts", [])
+                  if "id" in v}
+        missing = [m for m in batch if m.row_id not in scores]
+        if missing:
+            logger.warning("chat=%s 有 %d 条缺判定，回队重试", self.chat_id, len(missing))
+            await asyncio.to_thread(self._requeue, missing)
+
+        cut = float(cfg.get("confidence_cut", 0.5))
+        shadow = bool(cfg.get("shadow_mode", 1))
+
+        verdicts: list[Verdict] = []
+        for m in batch:
+            conf = scores.get(m.row_id)
+            if conf is None:
+                continue
+            # 付费商家用更高的门槛：只删"铁证"级广告（诈骗/黑产/外部推销），
+            # 放过他们付费购买的招揽权。否则白名单等于投毒通道。
+            threshold = max(cut, ADVERTISER_CUT) if m.whitelist == "advertiser" else cut
+            is_spam = conf >= threshold
+            verdicts.append(Verdict(m, is_spam, conf, "llm"))
+
+        spam = [v for v in verdicts if v.is_spam]
+        if not spam:
+            return
+
+        for v in spam:
+            action = "observe" if shadow else "delete"
+            await asyncio.to_thread(
+                db.save_spam_record, self.chat_id, v.message.user_id,
+                v.message.full_name, v.message.message_id, v.message.text,
+                v.confidence, "llm", action,
+            )
+
+        if shadow:
+            logger.info("chat=%s 影子模式：本应删除 %d 条（未执行）",
+                        self.chat_id, len(spam))
+            if self.notify:
+                await self.notify(spam)
+            return
+
+        for v in spam:
+            try:
+                await self.on_spam(v)
+                # 付费商家的删除不计入 del_count：
+                # 否则删几次就把付了钱的商家推成 repeat（惯犯）档，自相矛盾。
+                if v.message.whitelist != "advertiser":
+                    await asyncio.to_thread(
+                        db.bump_user_deleted, self.chat_id, v.message.user_id,
+                        v.message.full_name,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("删除失败 msg=%s: %s", v.message.message_id, exc)
+
+        if self.notify:
+            await self.notify(spam)
+
+    def _requeue(self, batch: list[PendingMessage]) -> None:
+        """把未判定的消息退回未检测状态，下轮重新取。"""
+        with db.tx() as conn:
+            conn.executemany("UPDATE messages SET is_checked=0 WHERE id=?",
+                             [(m.row_id,) for m in batch])
+
+    def _build_prompt(self, batch: list[PendingMessage]) -> list[dict]:
+        """构造请求。
+
+        结构严格分三层，前两层稳定以获得缓存命中（命中价 0.02 元/M vs 未命中 1 元/M）：
+            [GLOBAL_PROMPT]   跨群跨请求恒定
+            [群画像 + few-shot] 同群内每天最多变 1 次
+            [本批消息]         必然变化，放最后
+        """
+        cfg = self._cfg()
+        positives = db.fewshots(self.chat_id, "positive")
+        negatives = db.fewshots(self.chat_id, "negative")
+
+        profile = build_group_profile(
+            title=cfg.get("title") or f"群{self.chat_id}",
+            chat_nature=cfg.get("chat_nature", "general"),
+            now=time.strftime("%Y-%m-%d %H:%M"),
+            strictness=cfg.get("strictness", "strict"),
+        )
+        shots = build_fewshots(positives, negatives)
+
+        lines = []
+        for m in batch:
+            text = (m.text or "").replace("\n", " ")[:300]
+            prefix = f"[ID={m.row_id}]"
+            if m.marker:
+                prefix += f" {m.marker}"
+            hist = ""
+            if m.history:
+                past = [h.replace("\n", " ")[:40] for h in m.history[:3]]
+                hist = f" | 历史:{' / '.join(past)}"
+            lines.append(f"{prefix} 昵称={m.full_name[:20]} | 内容={text}{hist}")
+
+        msgs = [{"role": "system", "content": GLOBAL_PROMPT}]
+        if shots:
+            msgs.append({"role": "system", "content": shots})
+        msgs.append({"role": "system", "content": profile})
+        msgs.append({"role": "user", "content": BATCH_INSTRUCTION.format(
+            count=len(batch), messages="\n".join(lines))})
+        return msgs
+
+
+class PipelineManager:
+    """所有群的流水线。一个群慢不会拖住其他群：每个群独立 asyncio 任务。"""
+
+    def __init__(self, client: DeepSeekClient) -> None:
+        self.client = client
+        self._pipelines: dict[int, ChatPipeline] = {}
+        self._tasks: dict[int, asyncio.Task] = {}
+        self._stop = asyncio.Event()
+
+    def get(self, chat_id: int, on_spam, notify=None) -> ChatPipeline:
+        p = self._pipelines.get(chat_id)
+        if p is None:
+            p = ChatPipeline(chat_id, self.client, on_spam, notify)
+            self._pipelines[chat_id] = p
+        return p
+
+    async def start(self, chat_ids: list[int], on_spam, notify=None) -> None:
+        for cid in chat_ids:
+            p = self.get(cid, on_spam, notify)
+            self._tasks[cid] = asyncio.create_task(p.run(self._stop))
+        logger.info("已启动 %d 个群的检测流水线", len(self._tasks))
+
+    async def stop(self) -> None:
+        self._stop.set()
+        for t in self._tasks.values():
+            t.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks.values(), return_exceptions=True)

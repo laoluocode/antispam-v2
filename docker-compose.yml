@@ -1,0 +1,25 @@
+services:
+  antispam-bot:
+    build: .
+    container_name: antispam_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - TZ=Asia/Shanghai
+      - DB_NAME=/app/data/antispam.db
+      - PYTHONUNBUFFERED=1
+    volumes:
+      # 数据库放卷里：重建镜像不丢数据
+      - ./data:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import os,sys,time; sys.exit(0 if os.path.exists('/app/heartbeat.touch') and time.time()-os.path.getmtime('/app/heartbeat.touch') < 300 else 1)\""]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 30s

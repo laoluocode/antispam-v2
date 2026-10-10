@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+eval_samples.jsonl
+eval_report.json
+data/
+.git/
+.env
+._*
+.DS_Store
+test_*.py
