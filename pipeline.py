@@ -37,6 +37,7 @@ from detector_rules import (
     compute_trust,
     trust_marker,
 )
+from link_preview import has_link_preview, preview_fingerprint
 from prompts import BATCH_INSTRUCTION, GLOBAL_PROMPT, build_fewshots, build_group_profile
 from utils.normalize import invisible_ratio
 
@@ -57,6 +58,11 @@ ADVERTISER_CUT = 0.85
 # 数据库查询的短 TTL 缓存。避免每条消息都打一次库。
 PROFILE_TTL = 30.0
 ADMIN_TTL = 300.0
+
+# 协同刷屏阈值：同一预览目标在 24h 内被多少个不同账号引用。
+# 实测案例：两个账号交叉发单字母，指向同一个频道预览。
+# 正常群友分享同一链接的账号数远低于此。
+PREVIEW_SENDER_THRESHOLD = 3
 
 
 @dataclass
@@ -79,6 +85,11 @@ class PendingMessage:
     whitelist: str = ""      # "" | "advertiser"（trusted 的消息不会入队）
     report_id: int = 0       # >0 表示这条来自举报，判定后需回填举报状态
     origin: str = "group"    # group | forward（转发举报无法删除原消息）
+    # 链接预览：广告号用"短文本 + 频道预览"引流，正文 Telegram 不下发，
+    # 但预览目标（URL）是下发的，可作为协同刷屏的比对依据
+    preview_fp: str = ""
+    preview_url: str = ""
+    has_preview: bool = False
 
     @property
     def marker(self) -> str:
@@ -204,6 +215,19 @@ class ChatPipeline:
         if v.hit:
             await asyncio.to_thread(db.mark_checked, [msg.row_id])
             return Verdict(msg, True, 1.0, "local_rule", v.reason)
+
+        # --- 链接预览协同检测 ---
+        # 广告正文藏在下发不到的预览卡片里，但"多个账号指向同一预览目标"
+        # 是协同引流的确凿特征，且广告号绕不过去——它必须让群友看到广告。
+        if msg.preview_fp:
+            senders = await asyncio.to_thread(
+                db.record_preview, self.chat_id, msg.preview_fp,
+                msg.preview_url, msg.user_id)
+            if senders >= PREVIEW_SENDER_THRESHOLD:
+                await asyncio.to_thread(db.mark_checked, [msg.row_id])
+                return Verdict(
+                    msg, True, 1.0, "local_rule",
+                    f"协同引流（{senders} 个账号指向同一预览目标）")
 
         # --- 分流 ---
         cut = cfg["confidence_cut"]

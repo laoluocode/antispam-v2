@@ -204,6 +204,29 @@ CREATE TABLE IF NOT EXISTS spam_reports (
 CREATE INDEX IF NOT EXISTS idx_report_chat ON spam_reports (chat_id, reviewed);
 CREATE INDEX IF NOT EXISTS idx_report_reporter ON spam_reports (reporter_id, created_at);
 
+-- 链接预览指纹：广告号用"短文本 + 频道预览"引流，
+-- 正文 Telegram 不下发（实测 message.text 只有单字母），
+-- 但"多个账号在短时间窗内指向同一个预览目标"这个协同特征改不掉。
+CREATE TABLE IF NOT EXISTS preview_fingerprints (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL,          -- URL 归一化后的指纹
+    url         TEXT,
+    first_seen  DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_seen   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE (chat_id, fingerprint)
+);
+CREATE INDEX IF NOT EXISTS idx_preview_fp ON preview_fingerprints (chat_id, fingerprint);
+
+-- 指纹 -> 发布账号。用于计算"几个账号在发同一预览"
+CREATE TABLE IF NOT EXISTS preview_senders (
+    chat_id     INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL,
+    user_id     INTEGER NOT NULL,
+    seen_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (chat_id, fingerprint, user_id)
+);
+
 -- 被丢弃的消息（诊断用，回答"为什么这条没被处理"）
 CREATE TABLE IF NOT EXISTS dropped_messages (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -463,6 +486,56 @@ def user_stats(chat_id: int, user_id: int) -> dict:
 # --------------------------------------------------------------------------
 # 消息
 # --------------------------------------------------------------------------
+
+def record_preview(chat_id: int, fingerprint: str, url: str,
+                   user_id: int) -> int:
+    """记录一次预览指纹，返回**不同账号**的累计数量。
+
+    这是本项目的关键反制手段：广告正文拿不到，但"几个账号在发同一预览"
+    是协同刷屏的强证据，且广告号无法规避——它必须让群友看到广告。
+    """
+    now = _now()
+    with tx() as conn:
+        conn.execute("""
+            INSERT INTO preview_fingerprints
+                (chat_id, fingerprint, url, first_seen, last_seen)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(chat_id, fingerprint) DO UPDATE SET last_seen=excluded.last_seen
+        """, (chat_id, fingerprint, url, now, now))
+        conn.execute("""
+            INSERT INTO preview_senders (chat_id, fingerprint, user_id, seen_at)
+            VALUES (?,?,?,?)
+            ON CONFLICT(chat_id, fingerprint, user_id) DO UPDATE SET seen_at=excluded.seen_at
+        """, (chat_id, fingerprint, user_id, now))
+        row = conn.execute("""
+            SELECT COUNT(*) n FROM preview_senders
+            WHERE chat_id=? AND fingerprint=?
+              AND seen_at >= datetime('now', '-1 day')
+        """, (chat_id, fingerprint)).fetchone()
+    return row["n"] if row else 0
+
+
+def preview_sender_count(chat_id: int, fingerprint: str, hours: int = 24) -> int:
+    row = query_one("""
+        SELECT COUNT(*) n FROM preview_senders
+        WHERE chat_id=? AND fingerprint=?
+          AND seen_at >= datetime('now', ?)
+    """, (chat_id, fingerprint, f"-{hours} hours"))
+    return row["n"] if row else 0
+
+
+def list_previews(chat_id: int, hours: int = 24, limit: int = 20) -> list[sqlite3.Row]:
+    """列出近期预览指纹及其发布账号数，用于排查协同刷屏。"""
+    return query("""
+        SELECT f.fingerprint, f.url, f.last_seen,
+               (SELECT COUNT(*) FROM preview_senders p
+                 WHERE p.chat_id=f.chat_id AND p.fingerprint=f.fingerprint
+                   AND p.seen_at >= datetime('now', ?)) senders
+        FROM preview_fingerprints f
+        WHERE f.chat_id=? AND f.last_seen >= datetime('now', ?)
+        ORDER BY senders DESC, f.last_seen DESC LIMIT ?
+    """, (f"-{hours} hours", chat_id, f"-{hours} hours", limit))
+
 
 def save_dropped(chat_id: int, chat_title: str | None, user_id: int,
                  full_name: str | None, text: str, reason: str) -> None:

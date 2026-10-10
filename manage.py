@@ -132,6 +132,28 @@ def cmd_words(args) -> None:
         print("  manage.py words -100xxx          # 只看当前词表")
 
 
+def cmd_previews(args) -> None:
+    """列出近期链接预览指纹及引用它们的账号数。
+
+    用途：广告号用"短文本 + 频道预览"引流，正文拿不到，但
+    **多个账号指向同一预览目标**这个协同特征是可见的。
+    账号数 >= 3 的指纹会被自动判为协同引流并删除。
+    """
+    rows = db.list_previews(args.chat_id, args.hours, 30)
+    if not rows:
+        print(f"近 {args.hours} 小时无预览记录。")
+        print("若群里有此类广告却没记录，说明消息里没有可提取的 URL —— ")
+        print("查看日志中的「低信息量消息」行确认 bot 实际收到了什么。")
+        return
+    print(f"近 {args.hours} 小时预览指纹（按引用账号数排序）:")
+    print(f"  {'账号数':>5}  {'最后出现':<20} URL")
+    print("  " + "-" * 78)
+    for r in rows:
+        flag = "  <- 会自动判删" if r["senders"] >= 3 else ""
+        print(f"  {r['senders']:>5}  {str(r['last_seen'])[:19]:<20} "
+              f"{str(r['url'] or '')[:44]}{flag}")
+
+
 def cmd_list(args) -> None:
     rows = db.list_active_chats()
     if not rows:
@@ -181,6 +203,11 @@ def main() -> None:
 
     c = sub.add_parser("list", help="列出所有群")
     c.set_defaults(func=cmd_list)
+
+    e = sub.add_parser("previews", help="查看链接预览指纹（排查协同引流）")
+    e.add_argument("chat_id", type=int)
+    e.add_argument("--hours", type=int, default=24)
+    e.set_defaults(func=cmd_previews)
 
     d = sub.add_parser("words", help="管理群词汇表（正常词/禁词）")
     d.add_argument("chat_id", type=int)

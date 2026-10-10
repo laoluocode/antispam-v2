@@ -43,6 +43,7 @@ from telegram.ext import (
 import db
 from deepseek import DeepSeekClient
 from detector_rules import compute_trust, trust_marker
+from link_preview import has_link_preview, preview_fingerprint
 from pipeline import PendingMessage, PipelineManager, Verdict
 from prompts import NATURE_PRESETS
 
@@ -565,16 +566,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # bot 只收到单个字母 't'）。这类场景要能看到完整结构才查得动。
     if len(text.strip()) <= 3:
         origin = getattr(msg, "forward_origin", None)
+        _fp, _purl = preview_fingerprint(msg)
         logger.warning(
             "低信息量消息 chat=%s msg=%s text=%r "
             "is_auto_fwd=%s forward_origin=%s "
-            "entities=%s link_preview=%s reply_to=%s",
+            "has_preview=%s preview_url=%s entities=%s reply_to=%s",
             chat.id, msg.message_id, text,
             getattr(msg, "is_automatic_forward", None),
             type(origin).__name__ if origin else None,
+            has_link_preview(msg), (_purl or "(无)")[:90],
             [(e.type, e.offset, e.length, getattr(e, "url", None))
              for e in (msg.entities or [])],
-            bool(getattr(msg, "link_preview_options", None)),
             msg.reply_to_message.message_id if msg.reply_to_message else None,
         )
 
@@ -602,11 +604,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if await _is_cached_admin(chat.id, user.id):
         return
 
+    # 提取链接预览信息。正文可能只有一个字母，但预览目标是下发的，
+    # 它是识别"多账号协同引流"的唯一抓手（实测漏判案例的关键）。
+    fp, purl = preview_fingerprint(msg)
+    if fp:
+        logger.info("预览指纹 chat=%s msg=%s fp=%s url=%s",
+                    chat.id, msg.message_id, fp, purl[:80])
+
     pending = PendingMessage(
         row_id=row_id, message_id=msg.message_id, chat_id=chat.id,
         user_id=user.id, full_name=user.full_name, text=text,
         reply_to=msg.reply_to_message.message_id if msg.reply_to_message else None,
         timestamp=ts,
+        preview_fp=fp, preview_url=purl, has_preview=has_link_preview(msg),
     )
 
     pipeline = _manager.get(chat.id, on_spam=_make_on_spam(context.application),

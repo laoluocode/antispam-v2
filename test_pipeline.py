@@ -284,14 +284,20 @@ async def main():
     assert tail_hits == len(A) - 3
 
     # 常见英文回应不应算裸字母（否则误伤正常群友）
-    for w in ("ok", "hi", "no", "up", "dd", "88", "thx", "yes"):
+    for w in ("ok", "hi", "no", "up", "dd", "thx", "yes", "id", "qq", "vx"):
         assert not is_bare_letter(w), "%r 不该被算作裸字母" % w
-    print("  常见英文回应白名单生效: ok/hi/no/up/dd/88/thx/yes 均不触发")
+    print("  常见英文回应白名单生效: ok/hi/no/up/dd/thx/yes/id/qq/vx 均不触发")
+
+    # 数字必须排除：老库实测 '1' 出现 282 次且全是正常回应
+    for w in ("1", "66", "88", "666", "0", "2"):
+        assert not is_bare_letter(w), "%r（数字）不该被算作裸字母" % w
+    print("  数字已排除: 1/66/88/666/0/2 均不触发（老库 '1' 出现 282 次）")
 
     # 中文短回应不该触发
-    for w in ("在的", "嗯", "好的", "收到", "在呢"):
+    for w in ("在的", "嗯", "好的", "收到", "在呢", "谁", "好", "哦", "哈喽",
+              "有空", "在岗", "积分", "导航", "签到"):
         assert not check_bare_letter_spam(w, ["在的", "嗯", "好的"]).hit, w
-    print("  中文短回应不触发: 在的/嗯/好的/收到/在呢")
+    print("  中文短回应不触发: 在的/嗯/好的/收到/在呢/谁/好/哦/哈喽/有空/导航/签到")
 
     # 受信任用户豁免
     cid4 = -400

@@ -173,14 +173,20 @@ def repeat_key(text: str) -> str:
     return _NONCE_TAIL_PATTERN.sub("", norm) or norm
 
 
-# 纯 ASCII 字母/数字的极短消息。正常群友不会**反复**发这种内容——
-# 中文聊天里的短回应是「在的」「好的」「嗯」，不是裸字母。
-_BARE_LETTER_PATTERN = re.compile(r"^[A-Za-z0-9]{1,2}$")
+# 纯 ASCII **字母**的极短消息，且不含数字。
+#
+# 为什么排除数字：实测老库 21 万条消息里，`1` 出现 282 次且都是正常回应
+# （群友用 "1" 表示"在/同意"），`66`/`88` 同理。把数字算进来必然误伤。
+#
+# 为什么只留字母：实测长度<=2 的消息里，裸字母（d/n/m/t/o/u）**只出现在
+# 广告号**（Jfdueyp Kvdzehcm 发 15 条、Wdoggmgtbn Vhexblzls 发 6 条），
+# 正常群友的短回应全是中文（「谁」「好」「在呢」「哦」「哈喽」）。
+_BARE_LETTER_PATTERN = re.compile(r"^[A-Za-z]{1,3}$")
 
-# 常见英文回应词白名单。ok/hi/no 这类在正常聊天里确实会出现，
-# 若把它们算进裸字母刷屏会误伤。它们本身也没有广告价值。
+# 常见英文回应词白名单。这些在正常聊天里确实会出现，本身也没有广告价值。
 _BARE_LETTER_ALLOW = frozenset({
-    "ok", "no", "hi", "up", "dd", "gg", "3q", "88", "66", "thx",
+    "ok", "no", "hi", "up", "dd", "gg", "thx", "yes", "lol", "wtf",
+    "id", "qq", "vx", "tg",
 })
 
 # 触发所需的历史次数。实测线上广告号每 5-7 分钟发一个字母，10 分钟内
@@ -197,7 +203,7 @@ def is_bare_letter(text: str) -> bool:
 
 def check_bare_letter_spam(text: str, recent_texts: list[str],
                            threshold: int = BARE_LETTER_THRESHOLD) -> Verdict:
-    """单字母/双字符刷屏检测。
+    """裸字母刷屏检测（只匹配纯字母，不含数字）。
 
     实测案例（2026-10-10，南京苏州集团）：
       账号 A: n d d d n n d d m d n d d m   （14 条，每 5-7 分钟一条）
@@ -211,6 +217,10 @@ def check_bare_letter_spam(text: str, recent_texts: list[str],
     这条规则同时覆盖两种变体：
       · 拆字：把一句话拆成单字分多条发（规避整句关键词匹配）
       · 单字母 + 链接预览：用字母当载体，广告在预览里
+
+    实测误伤边界（老库 21 万条消息）：
+      `1` 出现 282 次、`66`/`88` 类似——都是正常回应，**必须排除数字**；
+      正常群友的超短消息全是中文（谁/好/在呢/哦/哈喽），不会用裸字母。
     """
     t = (text or "").strip()
     if not is_bare_letter(t):
