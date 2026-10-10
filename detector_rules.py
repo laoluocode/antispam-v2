@@ -231,6 +231,50 @@ def check_bare_letter_spam(text: str, recent_texts: list[str],
     return _NO_HIT
 
 
+# t.me 链接里的用户名/频道标识
+_TME_USERNAME = re.compile(r"(?:https?://)?t\.me/(?:s/)?([A-Za-z0-9_]{4,})", re.I)
+_TME_PRIVATE = re.compile(r"(?:https?://)?t\.me/c/", re.I)
+
+
+def extract_tme_identifiers(text: str) -> set[str]:
+    """抽取文本里所有 t.me 目标标识（小写用户名）。"""
+    out = set()
+    for m in _TME_USERNAME.finditer(text or ""):
+        name = m.group(1).lower()
+        # 纯数字是帖子 ID 不是用户名（t.me/xxx/123 里的 123 不会匹配到这里，
+        # 但 t.me/123 会被匹配，排除掉）
+        if name.isdigit():
+            continue
+        out.add(name)
+    return out
+
+
+def check_external_channel_link(text: str, managed: set[str]) -> Verdict:
+    """预览/链接指向**非本群体系**的 t.me 目标 -> 外部引流。
+
+    为什么这条规则有效（实测背景）：
+    这些群形成了"集团"式频道体系，群主自己运营榜单/报告/资讯频道，
+    群友转发自己频道的帖子是常态。广告号利用这个习惯，把**外部频道**
+    的帖子当预览卡片发进群——正文 Telegram 不下发，bot 只看到单字母。
+
+    但**链接指向哪里是可见的**。指向群主管理的频道 = 正常；
+    指向一个陌生频道 = 引流。这是"关系"层面的判断，与广告文案无关，
+    所以广告号改文案也绕不过去。
+
+    managed 由调用方提供，应包含：本群自身、各群的 linked_chat，
+    以及运营方在群描述里公开的频道。
+    """
+    ids = extract_tme_identifiers(text)
+    if not ids:
+        return _NO_HIT
+    unmanaged = {i for i in ids if i not in managed}
+    if unmanaged and len(unmanaged) == len(ids):
+        # 全部指向陌生目标才算——只要有一个是自家频道，就不判，
+        # 避免把"同时提到自家榜单和外部链接"的正常消息误伤
+        return Verdict(True, f"外部频道引流（{'、'.join(list(unmanaged)[:2])}）")
+    return _NO_HIT
+
+
 def check_repeat(text: str, recent_texts: list[str], threshold: int = 3) -> Verdict:
     """重复刷屏检测。
 

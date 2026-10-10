@@ -32,6 +32,7 @@ from detector_rules import (
     INVISIBLE_MIN_LENGTH,
     INVISIBLE_RATIO_THRESHOLD,
     check_bare_letter_spam,
+    check_external_channel_link,
     check_local,
     check_repeat,
     compute_trust,
@@ -125,6 +126,7 @@ class ChatPipeline:
         self._profile_cache: dict[int, tuple[float, dict, str]] = {}
         self._history_cache: dict[int, tuple[float, list[str]]] = {}
         self._admin_cache: tuple[float, set[int]] = (0.0, set())
+        self._managed_cache: tuple[float, set[str]] = (0.0, set())
         self.last_error: str | None = None
 
     # -- 配置读取 ---------------------------------------------------------
@@ -163,6 +165,15 @@ class ChatPipeline:
         )
         self._history_cache[user_id] = (now + PROFILE_TTL, texts)
         return texts
+
+    async def _managed_links(self) -> set[str]:
+        """本群体系的频道标识。缓存 10 分钟——它只在配置变更时才会变。"""
+        now = time.time()
+        if self._managed_cache[0] > now:
+            return self._managed_cache[1]
+        names = await asyncio.to_thread(db.managed_links, self.chat_id)
+        self._managed_cache = (now + 600, names)
+        return names
 
     async def _is_admin(self, user_id: int) -> bool:
         now = time.time()
@@ -215,6 +226,16 @@ class ChatPipeline:
         if v.hit:
             await asyncio.to_thread(db.mark_checked, [msg.row_id])
             return Verdict(msg, True, 1.0, "local_rule", v.reason)
+
+        # --- 外部频道链接检测 ---
+        # 这些群有"集团"式频道体系，群友转发自家频道是常态。广告号借这个习惯
+        # 发**外部频道**的帖子：正文 Telegram 不下发（bot 只看到单字母），
+        # 但链接指向哪里是可见的。指向陌生目标即引流。
+        managed = await self._managed_links()
+        ev = check_external_channel_link(msg.text, managed)
+        if ev.hit:
+            await asyncio.to_thread(db.mark_checked, [msg.row_id])
+            return Verdict(msg, True, 1.0, "local_rule", ev.reason)
 
         # --- 链接预览协同检测 ---
         # 广告正文藏在下发不到的预览卡片里，但"多个账号指向同一预览目标"

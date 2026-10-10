@@ -93,6 +93,24 @@ def _is_admin_user(user_id: int | None) -> bool:
     return bool(ADMIN_ID) and user_id == ADMIN_ID
 
 
+async def _learn_managed_links(app: Application, chat_id: int) -> None:
+    """学习本群体系的频道标识：群自己的 username + 群描述里的 @提及。
+
+    这些群的运营方习惯把自家榜单/报告/资讯频道写在群描述里（实测确认），
+    所以能自动抓取，不需要人工维护白名单。
+    """
+    try:
+        c = await app.bot.get_chat(chat_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读取群信息失败 chat=%s: %s", chat_id, exc)
+        return
+    hints = db.mine_channel_hints(c.description, c.username)
+    await asyncio.to_thread(db.set_chat_field, chat_id, "managed_links", hints)
+    await asyncio.to_thread(db.set_chat_username, chat_id, c.username)
+    logger.info("群体系频道 chat=%s username=%s managed=%s",
+                chat_id, c.username, hints)
+
+
 async def _refresh_admins(app: Application, chat_id: int) -> set[int]:
     """刷新并缓存群管理员。TTL 由 pipeline 侧各自控制。"""
     try:
@@ -464,6 +482,9 @@ async def _auto_register(app: Application, chat, added_by: int | None) -> bool:
 
     await asyncio.to_thread(db.register_chat, chat.id, chat.title or "",
                             AUTO_REGISTER_NATURE, shadow_mode=False)
+    # 抓取群的 username 与描述里公布的频道，写入 managed_links。
+    # 用于判断 t.me 链接是"自家频道"还是"外部引流"。
+    await _learn_managed_links(app, chat.id)
     await asyncio.to_thread(db.set_chat_field, chat.id, "confidence_cut",
                             AUTO_REGISTER_CUT)
     await asyncio.to_thread(db.set_chat_field, chat.id, "strictness", "standard")
@@ -1188,8 +1209,15 @@ async def job_report_board(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def job_refresh_admins(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """定期刷新管理员列表与群体系频道。
+
+    群描述会变（新增榜单/报告频道），所以这个也要跟着刷，
+    否则新加的自家频道会被误判成外部引流。
+    """
     for r in await asyncio.to_thread(db.list_active_chats):
-        await _refresh_admins(context.application, r["chat_id"])
+        cid = r["chat_id"]
+        await _refresh_admins(context.application, cid)
+        await _learn_managed_links(context.application, cid)
 
 
 async def job_heartbeat_check(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1226,6 +1254,7 @@ async def post_init(app: Application) -> None:
     )
     for cid in ids:
         await _refresh_admins(app, cid)
+        await _learn_managed_links(app, cid)
 
     logger.info("已上线，模型=%s，服务 %d 个群（未注册的群会被自动注册）",
                 MODEL_NAME, len(ids))

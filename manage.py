@@ -132,6 +132,39 @@ def cmd_words(args) -> None:
         print("  manage.py words -100xxx          # 只看当前词表")
 
 
+def cmd_links(args) -> None:
+    """查看/设置本群体系的频道标识。
+
+    用途：判断一条 t.me 链接是"自家频道"还是"外部引流"。
+    这些群的运营方把自家榜单/报告/资讯频道写在群描述里，程序会定期自动抓取；
+    本命令用于查看抓取结果，或在描述没写全时手工补充。
+    """
+    if args.add:
+        cur = db.managed_links(args.chat_id)
+        cur.add(args.add.lstrip("@").lower())
+        db.set_chat_field(args.chat_id, "managed_links", ",".join(sorted(cur)))
+        print(f"已加入 {args.add}")
+    if args.remove:
+        cur = db.managed_links(args.chat_id)
+        cur.discard(args.remove.lstrip("@").lower())
+        db.set_chat_field(args.chat_id, "managed_links", ",".join(sorted(cur)))
+        print(f"已移除 {args.remove}")
+
+    row = db.get_chat(args.chat_id)
+    if not row:
+        print(f"群 {args.chat_id} 不存在")
+        return
+    print(f"群 {args.chat_id}（{row['title']}）")
+    print(f"  群自己的 username : {row['username'] or '(未设置)'}")
+    print(f"  原始 managed_links: {row['managed_links'] or '(空)'}")
+    print(f"  生效的自家频道集合:")
+    for n in sorted(db.managed_links(args.chat_id)):
+        print(f"    @{n}")
+    print()
+    print("  指向上述之外的目标的 t.me 链接会被判为外部引流并删除。")
+    print("  用法：manage.py links -100xxx [--add 频道名] [--remove 频道名]")
+
+
 def cmd_previews(args) -> None:
     """列出近期链接预览指纹及引用它们的账号数。
 
@@ -203,6 +236,12 @@ def main() -> None:
 
     c = sub.add_parser("list", help="列出所有群")
     c.set_defaults(func=cmd_list)
+
+    f = sub.add_parser("links", help="查看/设置本群体系的频道标识")
+    f.add_argument("chat_id", type=int)
+    f.add_argument("--add", help="加入一个频道 username")
+    f.add_argument("--remove", help="移除一个频道 username")
+    f.set_defaults(func=cmd_links)
 
     e = sub.add_parser("previews", help="查看链接预览指纹（排查协同引流）")
     e.add_argument("chat_id", type=int)

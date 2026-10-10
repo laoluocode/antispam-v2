@@ -22,6 +22,7 @@ V1 的致命缺陷是全局 `bot_settings` 与全局白名单——A 群加白�
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -45,6 +46,7 @@ PRAGMA foreign_keys=ON;
 CREATE TABLE IF NOT EXISTS chats (
     chat_id          INTEGER PRIMARY KEY,
     title            TEXT,
+    username         TEXT,                        -- 群的公开 username（用于判定 t.me 链接归属）
     chat_nature      TEXT    DEFAULT 'general',   -- general | adult_service | trade
     strictness       TEXT    DEFAULT 'strict',    -- strict | standard | loose
     confidence_cut   REAL    DEFAULT 0.50,        -- 判定阈值（可调，不动 prompt）
@@ -59,6 +61,8 @@ CREATE TABLE IF NOT EXISTS chats (
     daily_token_cap  INTEGER DEFAULT 300000,      -- 每群每日 token 预算
     report_limit     INTEGER DEFAULT 20,          -- 每人每日举报额度
     log_channel_id   INTEGER,                     -- 删除记录频道（0/NULL=不发）
+    managed_links    TEXT,                        -- 本群体系的频道标识（逗号分隔）
+                                                  -- 指向这些目标的 t.me 链接属正常
     normal_words     TEXT,                        -- 本群正常话题词，逗号分隔
                                                   -- 防止把群内惯例词误判为广告
     blocked_words    TEXT,                        -- 本群明确要删的词，逗号分隔
@@ -283,6 +287,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ("fastlane_seconds", "INTEGER DEFAULT 15"),
             ("normal_words", "TEXT"),
             ("blocked_words", "TEXT"),
+            ("managed_links", "TEXT"),
+            ("username", "TEXT"),
         ],
         "spam_reports": [
             ("source", "TEXT DEFAULT 'in_group'"),
@@ -392,6 +398,7 @@ def set_chat_field(chat_id: int, field: str, value: Any) -> None:
         "notify_admin", "report_board", "report_min_rate", "fastlane_seconds",
         "batch_seconds", "batch_max", "daily_token_cap", "is_active",
         "report_limit", "log_channel_id", "normal_words", "blocked_words",
+        "managed_links", "username",
     }
     if field not in allowed:
         raise ValueError(f"不允许修改字段: {field}")
@@ -853,6 +860,57 @@ def _split_words(raw: str | None) -> list[str]:
             seen.add(w)
             out.append(w)
     return out
+
+
+# 从群描述里抓 @username。这些群主运营方习惯把自家频道列在描述里
+# （实测：南京群/武汉群的 description 里写全了榜单、报告、资讯频道）。
+_DESC_MENTION = re.compile(r"@([A-Za-z][A-Za-z0-9_]{3,31})")
+
+
+def mine_channel_hints(description: str | None, own_username: str | None) -> str:
+    """从群描述抽取频道标识，返回逗号分隔串，用于写入 managed_links。
+
+    为什么这么做：这些群形成了"集团"式频道体系，运营方把自家频道
+    都写在群描述里。自动抓下来后，"链接指向自家还是外部"的判断
+    就不需要人工维护白名单。
+    """
+    names: list[str] = []
+    if own_username:
+        names.append(own_username.lstrip("@"))
+    for m in _DESC_MENTION.finditer(description or ""):
+        n = m.group(1)
+        if n not in names:
+            names.append(n)
+    return ",".join(names)
+
+
+def managed_links(chat_id: int) -> set[str]:
+    """本群体系的频道标识集合，用于判断 t.me 链接是"自家"还是"外部"。
+
+    组成：群自己的 username + 从群描述抓到的频道 + 显式配置 + 其他已注册群。
+    只要域名对得上其中之一，就认为不是外部引流。
+    """
+    names: set[str] = set()
+    row = query_one("SELECT username, managed_links FROM chats WHERE chat_id=?",
+                    (chat_id,))
+    if row:
+        if row["username"]:
+            names.add(str(row["username"]).lstrip("@").lower())
+        for w in (row["managed_links"] or "").split(","):
+            w = w.strip().lstrip("@").lower()
+            if w:
+                names.add(w)
+    # 其他已注册群也视作自家（同一条消息可能同时提到多个群）
+    for r in query("SELECT username FROM chats WHERE is_active=1 AND username IS NOT NULL"):
+        if r["username"]:
+            names.add(str(r["username"]).lstrip("@").lower())
+    return names
+
+
+def set_chat_username(chat_id: int, username: str | None) -> None:
+    with tx() as conn:
+        conn.execute("UPDATE chats SET username=? WHERE chat_id=?",
+                     (username, chat_id))
 
 
 def normal_words(chat_id: int) -> list[str]:

@@ -314,6 +314,38 @@ async def main():
           % ("命中" if (v13 and v13.is_spam) else "未命中"))
     assert not (v13 and v13.is_spam), "trusted 用户应豁免单字符规则"
 
+    print("=== 14. 回归：外部频道引流检测 ===")
+    from detector_rules import check_external_channel_link, extract_tme_identifiers
+
+    db.register_chat(-500, "武汉集团", "adult_service", shadow_mode=False)
+    db.set_chat_field(-500, "username", "wuhanjt")
+    db.set_chat_field(-500, "managed_links",
+                      "wuhanjt,wuhanjp,whjtbg2,whjtshangbangbot,wuhanjt_bot")
+    managed = db.managed_links(-500)
+    print("  自家频道集合: %s" % sorted(managed))
+
+    cases = [
+        ("https://t.me/wuhanjp/123", False, "自家榜单频道"),
+        ("https://t.me/whjtbg2", False, "自家报告频道"),
+        ("https://t.me/wdgx", True, "外部频道（实测案例）"),
+        ("https://t.me/some_spam_channel/99", True, "外部频道+帖子"),
+        ("看看这个 https://t.me/wdgx/1", True, "正文夹带外部链接"),
+        ("今天在汉口修车体验还行", False, "无链接"),
+    ]
+    for text, expect_hit, note in cases:
+        r = check_external_channel_link(text, managed)
+        ok = (r.hit == expect_hit)
+        print("  [%s] %-34s -> %s  %s"
+              % ("OK" if ok else "FAIL", text[:34],
+                 "命中" if r.hit else "放行", note))
+        assert ok, "%s 期望 hit=%s 实际=%s" % (text, expect_hit, r.hit)
+
+    print("  t.me 标识提取: %s" % sorted(extract_tme_identifiers(
+        "https://t.me/wdgx/1 和 t.me/wuhanjp 以及 t.me/123")))
+    print("  自家+外部混合不判（避免误伤）: %s"
+          % check_external_channel_link(
+              "https://t.me/wuhanjp 和 https://t.me/wdgx", managed).hit)
+
     os.unlink(tmp)
     print("\n全部通过")
 
