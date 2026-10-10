@@ -59,6 +59,9 @@ CREATE TABLE IF NOT EXISTS chats (
     daily_token_cap  INTEGER DEFAULT 300000,      -- 每群每日 token 预算
     report_limit     INTEGER DEFAULT 20,          -- 每人每日举报额度
     log_channel_id   INTEGER,                     -- 删除记录频道（0/NULL=不发）
+    normal_words     TEXT,                        -- 本群正常话题词，逗号分隔
+                                                  -- 防止把群内惯例词误判为广告
+    blocked_words    TEXT,                        -- 本群明确要删的词，逗号分隔
     is_active        INTEGER DEFAULT 1,
     created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -242,6 +245,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ("report_limit", "INTEGER DEFAULT 20"),
             ("log_channel_id", "INTEGER"),
             ("fastlane_seconds", "INTEGER DEFAULT 15"),
+            ("normal_words", "TEXT"),
+            ("blocked_words", "TEXT"),
         ],
         "spam_reports": [
             ("source", "TEXT DEFAULT 'in_group'"),
@@ -350,7 +355,7 @@ def set_chat_field(chat_id: int, field: str, value: Any) -> None:
         "title", "chat_nature", "strictness", "confidence_cut", "shadow_mode",
         "notify_admin", "report_board", "report_min_rate", "fastlane_seconds",
         "batch_seconds", "batch_max", "daily_token_cap", "is_active",
-        "report_limit", "log_channel_id",
+        "report_limit", "log_channel_id", "normal_words", "blocked_words",
     }
     if field not in allowed:
         raise ValueError(f"不允许修改字段: {field}")
@@ -728,6 +733,60 @@ def reporter_accuracy(reporter_id: int, chat_id: int = 0) -> tuple[int, int]:
     if not row:
         return 0, 0
     return (row["valid"] or 0), (row["total"] or 0)
+
+
+def _split_words(raw: str | None) -> list[str]:
+    """逗号/顿号/空格分隔的词表。去空去重，保序。"""
+    if not raw:
+        return []
+    out, seen = [], set()
+    for w in raw.replace("，", ",").replace("、", ",").replace(" ", ",").split(","):
+        w = w.strip()
+        if w and w not in seen:
+            seen.add(w)
+            out.append(w)
+    return out
+
+
+def normal_words(chat_id: int) -> list[str]:
+    """本群正常话题词。用于告诉模型"这些词在这里不算广告"。"""
+    row = query_one("SELECT normal_words FROM chats WHERE chat_id=?", (chat_id,))
+    return _split_words(row["normal_words"] if row else None)
+
+
+def blocked_words(chat_id: int) -> list[str]:
+    """本群明确要删的词。用于补充模型的领域知识。"""
+    row = query_one("SELECT blocked_words FROM chats WHERE chat_id=?", (chat_id,))
+    return _split_words(row["blocked_words"] if row else None)
+
+
+def add_word(chat_id: int, word: str, kind: str = "normal") -> list[str]:
+    """往词表加一个词（幂等）。返回加完后的完整词表。"""
+    if kind not in ("normal", "blocked"):
+        raise ValueError(f"未知词表类型: {kind}")
+    col = "normal_words" if kind == "normal" else "blocked_words"
+    cur = normal_words(chat_id) if kind == "normal" else blocked_words(chat_id)
+    if word not in cur:
+        cur.append(word)
+    value = ",".join(cur)
+    with tx() as conn:
+        r = conn.execute(f"UPDATE chats SET {col}=? WHERE chat_id=?",
+                         (value, chat_id))
+        if r.rowcount == 0:
+            raise ValueError(f"群 {chat_id} 不存在")
+    return cur
+
+
+def remove_word(chat_id: int, word: str, kind: str = "normal") -> list[str]:
+    if kind not in ("normal", "blocked"):
+        raise ValueError(f"未知词表类型: {kind}")
+    col = "normal_words" if kind == "normal" else "blocked_words"
+    cur = normal_words(chat_id) if kind == "normal" else blocked_words(chat_id)
+    cur = [w for w in cur if w != word]
+    with tx() as conn:
+        conn.execute(f"UPDATE chats SET {col}=? WHERE chat_id=?",
+                     (",".join(cur), chat_id))
+    return cur
 
 
 def set_log_channel(chat_id: int, channel_id: int | None) -> bool:

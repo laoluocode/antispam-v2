@@ -92,6 +92,46 @@ def cmd_set(args) -> None:
     print("已更新 " + ", ".join(changed) if changed else "无改动")
 
 
+def cmd_words(args) -> None:
+    """管理每群的词汇表。
+
+    为什么需要：每个群有自己的惯例词。某群的"导航"是目录机器人的固定指令，
+    判定器把它当广告会持续误删，而每次改 prompt 都要重新部署 + 废一次缓存。
+    做成每群一张表，群里发现误判当场加词即可。
+
+    改词表会更新 prompt 前缀 -> 该群缓存失效一次（约 0.004 元），
+    所以尽量攒几个词一起加，而不是逐词频繁改。
+    """
+    if not db.get_chat(args.chat_id):
+        print(f"群 {args.chat_id} 不存在")
+        return
+    kind = "blocked" if args.blocked else "normal"
+
+    if args.remove:
+        left = db.remove_word(args.chat_id, args.remove, kind)
+        print(f"已从{'禁词' if kind == 'blocked' else '正常词'}表移除「{args.remove}」")
+    elif args.add:
+        left = db.add_word(args.chat_id, args.add, kind)
+        label = "禁词" if kind == "blocked" else "正常词"
+        print(f"已把「{args.add}」加入{label}表")
+    else:
+        left = None
+
+    nw = db.normal_words(args.chat_id)
+    bw = db.blocked_words(args.chat_id)
+    print()
+    print(f"群 {args.chat_id} 当前词汇表:")
+    print(f"  正常词（单独出现不判广告）: {'、'.join(nw) if nw else '（空）'}")
+    print(f"  禁词  （出现即高置信度）  : {'、'.join(bw) if bw else '（空）'}")
+    if left is None:
+        print()
+        print("用法：")
+        print("  manage.py words -100xxx --add 导航")
+        print("  manage.py words -100xxx --add 尾课 --blocked")
+        print("  manage.py words -100xxx --remove 导航")
+        print("  manage.py words -100xxx          # 只看当前词表")
+
+
 def cmd_list(args) -> None:
     rows = db.list_active_chats()
     if not rows:
@@ -103,6 +143,11 @@ def cmd_list(args) -> None:
         print(f"{r['chat_id']:>16} {'开' if r['shadow_mode'] else '关':>5} "
               f"{r['strictness']:>9} {r['confidence_cut']:>5.2f} "
               f"{r['chat_nature']:>14}  {r['title'] or ''}")
+        nw = db.normal_words(r["chat_id"])
+        bw = db.blocked_words(r["chat_id"])
+        if nw or bw:
+            print(f"{'':>16} 词表: 正常词[{'、'.join(nw) or '空'}] "
+                  f"禁词[{'、'.join(bw) or '空'}]")
     print()
     print("  阈值含义：越高越保守（少删）。改阈值不动 prompt，也就不会废掉缓存。")
 
@@ -136,6 +181,14 @@ def main() -> None:
 
     c = sub.add_parser("list", help="列出所有群")
     c.set_defaults(func=cmd_list)
+
+    d = sub.add_parser("words", help="管理群词汇表（正常词/禁词）")
+    d.add_argument("chat_id", type=int)
+    d.add_argument("--add", help="加入一个词")
+    d.add_argument("--remove", help="移除一个词")
+    d.add_argument("--blocked", action="store_true",
+                   help="操作禁词表（默认操作正常词表）")
+    d.set_defaults(func=cmd_words)
 
     args = ap.parse_args()
     d = os.path.dirname(os.path.abspath(args.db))

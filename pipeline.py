@@ -423,6 +423,8 @@ class ChatPipeline:
             chat_nature=cfg.get("chat_nature", "general"),
             now=time.strftime("%Y-%m-%d %H:%M"),
             strictness=cfg.get("strictness", "strict"),
+            normal_words=db.normal_words(self.chat_id),
+            blocked_words=db.blocked_words(self.chat_id),
         )
         shots = build_fewshots(positives, negatives)
 

@@ -153,7 +153,7 @@ GROUP_PROFILE_TEMPLATE = """## 本群画像
 判定尺度：{strictness_hint}
 当前时间：{now}
 
-{nature_note}"""
+{nature_note}{vocab}"""
 
 NATURE_PRESETS = {
     "general": {
@@ -216,13 +216,47 @@ def build_fewshots(positives, negatives, max_pos=8, max_neg=8) -> str:
     return "\n".join(lines)
 
 
+def build_vocab(normal_words=None, blocked_words=None) -> str:
+    """构造词表段落。
+
+    为什么必须可配而不是写死在 prompt 里：每个群有自己的惯例词
+    （例如某群的"导航"是目录机器人的固定指令），
+    把它当广告会持续误删，而每次改 prompt 都要重新部署 + 废掉一次缓存。
+    做成每群一张表，群主自己加词即可。
+    """
+    normal = [w for w in (normal_words or []) if w]
+    blocked = [w for w in (blocked_words or []) if w]
+    if not normal and not blocked:
+        return ""
+
+    parts = ["\n\n## 本群词汇表\n"]
+    if normal:
+        parts.append(
+            "以下词在**本群**属于正常话题或惯例用语，"
+            "单独出现时**不要**判为广告（除非同时具备明确的外部推广特征）：\n"
+            + "、".join(normal)
+        )
+    if blocked:
+        parts.append(
+            "\n以下词在本群**明确属于广告**特征，出现即可给高置信度：\n"
+            + "、".join(blocked)
+        )
+    return "\n".join(parts)
+
+
 def build_group_profile(
     title: str,
     chat_nature: str = "general",
     now: str = "",
     strictness: str = "strict",
+    normal_words=None,
+    blocked_words=None,
 ) -> str:
-    """构造群画像段落。chat_nature 取 NATURE_PRESETS 的 key。"""
+    """构造群画像段落。chat_nature 取 NATURE_PRESETS 的 key。
+
+    ⚠️ 本段位于 prompt 的缓存前缀里。改动它会让该群的缓存失效一次
+    （约 0.004 元）。所以词表更新应尽量合并后一次改，而不是逐词频繁改。
+    """
     preset = NATURE_PRESETS.get(chat_nature, NATURE_PRESETS["general"])
     strictness_suffix = {
         "strict": "（严格档：只删除证据充分的广告）",
@@ -237,6 +271,7 @@ def build_group_profile(
         strictness_hint=preset["strictness_hint"] + strictness_suffix,
         now=now,
         nature_note=preset["nature_note"],
+        vocab=build_vocab(normal_words, blocked_words),
     )
 
 
