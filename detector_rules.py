@@ -86,10 +86,56 @@ def check_local(text: str, user_id: int, chat_id: int, blacklist_ids: set) -> Ve
 def signature(text: str) -> str:
     """消息指纹，用于重复刷屏检测。
 
-    归一化后比对，使 `个人外出` 与 `個 人 外 出` 视为同一条，
-    但保留长度信息以免不同消息归一化后碰撞。
+    归一化后比对，使 `个人外出` 与 `個 人 外 出` 视为同一条。
     """
     return normalize(text)
+
+
+# 尾部 nonce：`开课中❤️❤️ e` / `开课中❤️❤️ J` —— 广告号在固定文案后
+# 追加一个随机字符，使每条消息字符串都不同，从而绕过"完全相同才判重复"的检测。
+#
+# 注意 normalize 会先删掉空格与 emoji，`开课中❤️❤️ e` 归一化后是 `开课中e`，
+# 所以这里直接在归一化结果上剥掉尾部字母数字（而非先匹配分隔符）。
+_NONCE_TAIL_PATTERN = re.compile(r"[a-z0-9]{1,3}$")
+
+# 参与重复检测的最小归一化长度。低于此长度的短句（"在的"、"好的"）不参与，
+# 避免不同短语被剥掉尾部后归一成同一个 key。
+MIN_REPEAT_KEY_LENGTH = 4
+
+
+def repeat_key(text: str) -> str:
+    """重复检测用的指纹：归一化 + 去掉尾部随机 nonce。
+
+    实测价值：线上有广告号用 `开课中❤️❤️` 配 `e/J/t/K/L/r/4` 连发 7 条，
+    归一化后仅尾部 nonce 不同。剥掉尾部后 7 条归一为 `开课中`，即可判重复。
+
+    长度门槛加在**归一化结果**上（>= 4 字符）而非剥离后：
+    `开课中e` 归一化后 4 字符符合门槛，剥离得 3 字符的 `开课中` 仍应采用；
+    而 `在的`（2 字符）不达门槛，不参与重复检测，避免正常短语被误归一。
+    """
+    norm = normalize(text)
+    if len(norm) < MIN_REPEAT_KEY_LENGTH:
+        return norm
+    return _NONCE_TAIL_PATTERN.sub("", norm) or norm
+
+
+def check_repeat(text: str, recent_texts: list[str], threshold: int = 3) -> Verdict:
+    """重复刷屏检测。
+
+    recent_texts 为该用户在本群的近期消息（调用方提供，已按时间倒序）。
+    同一 repeat_key 出现 >= threshold 次即判为刷屏。
+
+    这是确定性规则而非 AI 判定：重复行为本身就是广告特征，
+    且归一化去 nonce 后正常群友几乎不会触发（正常人不会把同一句话发三遍）。
+    """
+    key = repeat_key(text)
+    if len(key) < 4:
+        return _NO_HIT
+
+    count = sum(1 for t in recent_texts if repeat_key(t) == key)
+    if count >= threshold:
+        return Verdict(True, f"重复刷屏（同一内容第 {count + 1} 次）")
+    return _NO_HIT
 
 
 if __name__ == "__main__":

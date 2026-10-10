@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -37,7 +38,9 @@ logger = logging.getLogger(__name__)
 # 官方并发限制：deepseek-flash 为 2500（账号级），无需主动限流。
 # 但单请求超时需放宽——官方最长会保活 10 分钟。
 DEFAULT_TIMEOUT = 300.0
-DEFAULT_MAX_TOKENS = 4000
+# 输出上限。thinking 关闭后每条 verdict 约 12 token，
+# 200 条批次的纯 JSON 约 2.5k token；留足余量避免 finish_reason=length 截断。
+DEFAULT_MAX_TOKENS = 16000
 
 # 空响应重试次数。官方 JSON Output 偶发返回空 content，
 # 重试 2 次可覆盖绝大多数瞬时情况。
@@ -47,6 +50,26 @@ RETRY_BACKOFF_SECONDS = 2.0
 
 class DeepSeekError(RuntimeError):
     """调用失败。调用方必须保留消息待下轮重试，不可视为"无广告"。"""
+
+
+def parse_verdicts(content: str) -> dict[int, str]:
+    """从模型返回中提取 {记录ID: level}。
+
+    **容忍截断**：输出被 max_tokens 切断时，完整的那部分 verdict 依然有效。
+    逐个提取 `"id":N` 与紧随其后的 `"level":"X"`，不依赖整体 JSON 可解析。
+
+    这样做的意义：截断只会让**尾部若干条**缺少判定，由调用方重试这些具体消息；
+    而不是整批报废。若把截断当"无广告"处理，就成了静默漏删。
+    """
+    verdicts: dict[int, str] = {}
+    # 匹配 {"id":123,"level":"high",...}，允许字段间有空白
+    pattern = re.compile(
+        r'"id"\s*:\s*(-?\d+)\s*,\s*"level"\s*:\s*"(high|medium|none)"',
+        re.IGNORECASE,
+    )
+    for match in pattern.finditer(content or ""):
+        verdicts[int(match.group(1))] = match.group(2).lower()
+    return verdicts
 
 
 @dataclass
@@ -207,8 +230,28 @@ class DeepSeekClient:
             request_usage.add(call_usage)
 
             content = None
+            finish_reason = None
             if response.choices:
                 content = response.choices[0].message.content
+                finish_reason = response.choices[0].finish_reason
+
+            # 输出被 max_tokens 截断：JSON 不完整。
+            # 不直接放弃——先尝试挽救已完整的部分，缺失的由调用方重试。
+            if finish_reason == "length":
+                salvaged = parse_verdicts(content or "")
+                self.usage.add(request_usage)
+                logger.warning(
+                    "输出被截断（finish_reason=length, completion_tokens=%s），"
+                    "已挽救 %d 条判定，其余需重试",
+                    call_usage.completion_tokens, len(salvaged),
+                )
+                return (
+                    {"verdicts": [
+                        {"id": rid, "level": lv, "reason": ""}
+                        for rid, lv in salvaged.items()
+                    ], "truncated": True},
+                    request_usage,
+                )
 
             if not content or not content.strip():
                 # 官方已知问题：JSON Output 偶发空 content。
@@ -236,8 +279,23 @@ class DeepSeekClient:
             try:
                 parsed = json.loads(content)
             except json.JSONDecodeError as exc:
+                # 整体 JSON 损坏（截断或格式错乱）——用逐个提取挽救。
+                salvaged = parse_verdicts(content)
+                if salvaged:
+                    self.usage.add(request_usage)
+                    logger.warning(
+                        "JSON 解析失败但已挽救 %d 条判定（第 %d 次）: %s",
+                        len(salvaged), attempt + 1, exc,
+                    )
+                    return (
+                        {"verdicts": [
+                            {"id": rid, "level": lv, "reason": ""}
+                            for rid, lv in salvaged.items()
+                        ], "truncated": True},
+                        request_usage,
+                    )
                 last_error = exc
-                logger.warning("JSON 解析失败（第 %d 次）: %s | 原文: %s",
+                logger.warning("JSON 解析失败且无法挽救（第 %d 次）: %s | 原文: %s",
                                attempt + 1, exc, content[:300])
                 continue
 
