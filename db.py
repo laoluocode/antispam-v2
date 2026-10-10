@@ -963,6 +963,71 @@ def verdict_memory_list(chat_id: int = 0, limit: int = 50) -> list[sqlite3.Row]:
     return query("SELECT * FROM verdict_memory ORDER BY id DESC LIMIT ?", (limit,))
 
 
+def count_all_deletions(hours: int = 12) -> int:
+    row = query_one("""SELECT COUNT(*) n FROM spam_records
+                       WHERE action='delete'
+                         AND created_at >= datetime('now', ?)""",
+                    (f"-{hours} hours",))
+    return row["n"] if row else 0
+
+
+def sample_deletions(chat_id: int = 0, hours: int = 12,
+                     limit: int = 5) -> list[sqlite3.Row]:
+    """随机抽取最近的删除记录，供管理员复核。
+
+    为什么需要（来自实际使用数据）：上线以来 1844 次删除，管理员只复核了 1 次。
+    这说明系统在"盲信"状态下运行——而"边用边更新"需要反馈才能更新。
+    复核率 0.05% 意味着反馈回路基本没闭合。
+
+    抽样比全量复核可行得多：每次只看几条，但能持续验证判定质量，
+    并且每一条"确实是广告/确实是误删"都会变成判定记忆或反例样本。
+    """
+    where = ["action='delete'", "text_snapshot IS NOT NULL",
+             "created_at >= datetime('now', ?)"]
+    args: list = [f"-{hours} hours"]
+    if chat_id:
+        where.append("chat_id = ?")
+        args.append(chat_id)
+    # 已抽样过的 ID 用字符串集合过滤（不写在 SQL 里——把逗号分隔串
+    # 拆成整数集合再 IN 会让 SQL 变得又长又脆，实测第一版就是这么写坏的）
+    sampled = sampled_ids()
+    rows = query(f"""
+        SELECT id, chat_id, user_id, full_name, text_snapshot, confidence,
+               source, created_at
+        FROM spam_records WHERE {' AND '.join(where)}
+        ORDER BY RANDOM() LIMIT ?
+    """, (*args, max(limit * 4, 20)))
+    return [r for r in rows if r["id"] not in sampled][:limit]
+
+
+def sampled_ids() -> set[int]:
+    row = query_one("SELECT value FROM chat_settings "
+                    "WHERE chat_id=0 AND key='sampled_ids'")
+    if not row or not row["value"]:
+        return set()
+    out = set()
+    for x in str(row["value"]).split(","):
+        if x.strip().isdigit():
+            out.add(int(x))
+    return out
+
+
+def mark_sampled(record_ids: list[int]) -> None:
+    """记录已抽样过的 ID，避免同一批反复推送。"""
+    if not record_ids:
+        return
+    existing = query_one("SELECT value FROM chat_settings "
+                         "WHERE chat_id=0 AND key='sampled_ids'")
+    ids = set((existing["value"] if existing else "").split(","))
+    ids.discard("")
+    ids.update(str(i) for i in record_ids)
+    # 只保留最近 2000 个，避免无限增长
+    keep = sorted(ids, key=lambda x: int(x) if x.isdigit() else 0)[-2000:]
+    execute("""INSERT INTO chat_settings (chat_id, key, value) VALUES (0,?,?)
+               ON CONFLICT(chat_id,key) DO UPDATE SET value=excluded.value""",
+            ("sampled_ids", ",".join(keep)))
+
+
 def verdict_health(chat_id: int = 0, hours: int = 24) -> dict:
     """判定健康度：预测分布 + 语料倾斜 + 人工推翻率。
 

@@ -464,6 +464,9 @@ def _spam_keyboard(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
 # 其余合并成一条摘要。摘要里的条目仍可用 /recent 逐个处理。
 MAX_DETAIL_NOTIFY = 6
 
+# 每次抽样复核推送几条
+SAMPLE_REVIEW_COUNT = 5
+
 
 async def _notify_spam(bot, verdicts: list[Verdict], shadow: bool) -> None:
     """逐条通知管理员，每条带自己的操作按钮。
@@ -1410,6 +1413,38 @@ async def job_refresh_admins(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _learn_managed_links(context.application, cid)
 
 
+async def job_sample_review(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """抽样复核：每天推几条删除记录给管理员确认。
+
+    来自实际使用数据的判断：上线以来 1844 次删除、管理员只复核了 1 次（0.05%）。
+    系统在"盲信"状态下运行——而"边用边更新"需要反馈才能更新。
+    抽样复核每次只看几条，但能让准确率**可测量**，并且每条结论
+    都会沉淀成判定记忆（同类内容今后自动处理）。
+    """
+    rows = await asyncio.to_thread(db.sample_deletions, 0, 12, SAMPLE_REVIEW_COUNT)
+    if not rows:
+        return
+    await asyncio.to_thread(db.mark_sampled, [r["id"] for r in rows])
+
+    total = await asyncio.to_thread(db.count_all_deletions)
+    lines = [
+        f"🔍 抽样复核（随机抽了 {len(rows)} 条 / 近 12 小时共删 {total} 条）",
+        "",
+        "请逐条判断。**判对了就不用操作**，判错了点按钮：",
+    ]
+    for i, r in enumerate(rows, 1):
+        row = await asyncio.to_thread(db.get_chat, r["chat_id"])
+        name = (row["title"] if row else "") or r["chat_id"]
+        conf = r["confidence"] if r["confidence"] is not None else -1
+        lines.append(
+            f"{i}. [{str(name)[:10]}] {str(r['text_snapshot'])[:44]!r}\n"
+            f"   置信度 {conf:.2f} / {r['source']} / 记录 #{r['id']}"
+        )
+    lines += ["", "为什么做这个：实测 1844 次删除只被复核过 1 次，",
+              "反馈回路没闭合的话，判定质量就是不可测的。"]
+    await _send_admin(context.bot, "\n".join(lines))
+
+
 async def job_self_evolve(context: ContextTypes.DEFAULT_TYPE) -> None:
     """自进化：挖候选规则 + 检查毕业。
 
@@ -1693,6 +1728,9 @@ def main() -> None:
         jq.run_repeating(job_backfill, interval=600, first=60)
         # 自进化：每天 04:00 挖候选与检查毕业（避开流量高峰）
         jq.run_daily(job_self_evolve, time=dtime(hour=4, minute=0, tzinfo=TZ))
+        # 抽样复核：每天 20:00 推几条，让判定质量可测量
+        jq.run_daily(job_sample_review,
+                     time=dtime(hour=20, minute=0, tzinfo=TZ))
         jq.run_daily(job_cleanup, time=dtime(hour=4, minute=30, tzinfo=TZ))
         jq.run_daily(job_report_board, time=dtime(hour=23, minute=55, tzinfo=TZ))
     else:

@@ -1080,6 +1080,55 @@ async def main():
           % ("含!" if "武汉养生" in names else "不含 ✓"))
     assert "武汉养生" not in names, "有误命中的规则不得毕业"
 
+    print("=== 28. 回归：抽样复核（让判定质量可测量）===")
+    # 来自实际使用数据：上线以来 1844 次删除，管理员只复核了 1 次（0.05%）。
+    # 系统在"盲信"状态下运行——而"边用边更新"需要反馈才能更新。
+    # 抽样复核每次只看几条，但让准确率可测量，且每条结论都沉淀成判定记忆。
+    cidV = -997
+    db.register_chat(cidV, "抽样测试群", "general", shadow_mode=False)
+    for i in range(20):
+        t = "广告样本内容 %d 加微信" % i
+        db.save_message(cidV, 9700 + i, 61, "广告号", t, None, "t")
+        db.save_spam_record(cidV, 61, "广告号", 9700 + i, t, 0.9, "llm",
+                            "delete")
+    print("  造 20 条删除记录")
+
+    rows = db.sample_deletions(cidV, 24, 5)
+    print("  抽样 %d 条（应 =5）" % len(rows))
+    assert len(rows) == 5, "应按 limit 返回"
+
+    # 抽样不重复：标记后再抽应避开已抽过的
+    ids = [r["id"] for r in rows]
+    db.mark_sampled(ids)
+    print("  标记已抽样 %d 条 -> sampled_ids=%d 个" % (len(ids),
+                                                    len(db.sampled_ids())))
+    assert len(db.sampled_ids()) == len(ids)
+    rows2 = db.sample_deletions(cidV, 24, 5)
+    overlap = set(r["id"] for r in rows2) & set(ids)
+    print("  再次抽样 %d 条，与上批重叠 %d 条（应为 0，避免重复打扰）"
+          % (len(rows2), len(overlap)))
+    assert not overlap, "已抽过的不应重复推送"
+
+    # chat_id 过滤
+    cidW = -998
+    db.register_chat(cidW, "另一群", "general", shadow_mode=False)
+    db.save_message(cidW, 9800, 62, "广告号", "另一群的广告内容测试", None, "t")
+    db.save_spam_record(cidW, 62, "广告号", 9800, "另一群的广告内容测试",
+                        0.9, "llm", "delete")
+    only_w = db.sample_deletions(cidW, 24, 10)
+    print("  按群过滤: cidW 抽到 %d 条，chat_id 全部匹配=%s"
+          % (len(only_w), all(r["chat_id"] == cidW for r in only_w)))
+    assert only_w and all(r["chat_id"] == cidW for r in only_w)
+
+    # 只抽样有内容的记录（无 text_snapshot 的没法让管理员判断）
+    db.save_spam_record(cidV, 61, "无内容", 9999, None, 0.9, "llm", "delete")
+    got_none = [r for r in db.sample_deletions(cidV, 24, 20)
+                if not r["text_snapshot"]]
+    print("  抽样结果里无内容的条数: %d（应为 0）" % len(got_none))
+    assert not got_none, "无内容的记录不该进入抽样"
+
+    print("  计数: count_all_deletions=%d" % db.count_all_deletions(24))
+
     os.unlink(tmp)
     print("\n全部通过")
 
