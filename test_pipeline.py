@@ -778,6 +778,41 @@ async def main():
     assert not missing, "init_db 应补回缺失的表"
     os.unlink(tmp2)
 
+    print("=== 22. 回归：全角数字绕过（实测发现的现成口子）===")
+    # 来源：Unicode 混淆对抗研究（不可见字符 + 字符替换 + 全角）。
+    # 全角数字 U+FF10-U+FF19 的 \w 为真，不被噪声正则删除，也没做 ASCII 映射，
+    # 于是 "我电话１３８..." 能直接绕过手机号规则。
+    from detector_rules import check_local, fold_digits
+
+    cases = [
+        ("我电话13812345678", True, "半角手机号"),
+        ("我电话１３８１２３４５６７８", True, "全角手机号"),
+        ("１３８１２３４５６７８", True, "纯全角手机号"),
+        ("＋８６１３８１２３４５６７８", True, "全角带国际区号"),
+        ("我的卡号６２１７００１２３４５６７８９０", True, "全角银行卡号"),
+        ("今天在汉口修的车体验还行", False, "正常聊天"),
+        ("我电话１３８", False, "位数不足"),
+        ("Ill", False, "纯字母（折叠不能把它变成数字）"),
+    ]
+    for text, expect, label in cases:
+        v = check_local(text, 1, -1, set())
+        ok = (v.hit == expect)
+        print("  [%s] %-20s %-30r -> %s"
+              % ("OK" if ok else "FAIL", label, text[:28],
+                 "命中" if v.hit else "放过"))
+        assert ok, "%s 期望 hit=%s 实际=%s" % (label, expect, v.hit)
+
+    # 折叠必须是无损的：只动全角数字，不碰字母
+    print("  fold_digits('Ill')=%r  fold_digits('１２３')=%r"
+          % (fold_digits("Ill"), fold_digits("１２３")))
+    assert fold_digits("Ill") == "Ill", "折叠不能改字母（否则 Ill->111 会误伤）"
+    assert fold_digits("１２３") == "123"
+
+    # normalize 也应对齐：全角与半角归一化后必须一致
+    from utils.normalize import normalize
+    assert (normalize("我电话１３８１２３４５６７８")
+            == normalize("我电话13812345678")), "归一化后应一致"
+
     os.unlink(tmp)
     print("\n全部通过")
 

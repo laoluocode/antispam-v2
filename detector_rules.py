@@ -29,6 +29,24 @@ TELEGRAM_LINK_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+# 数字类模式的安全折叠：只把全角数字转半角，**不做其他归一化**。
+#
+# 为什么不能直接用 normalize()：它是为模糊匹配设计的有损变换
+# （l->1、o->0、谐音替换、去噪声），拿它做 L0 判定会引入误伤——
+# 例如 "Ill" 会被折成 "111"。而全角数字的折叠是无损的、可逆的，
+# 且实测正负样本里都从未出现过全角数字，因此零误伤风险。
+#
+# 修的是一个现成的绕过口子：
+#   "我电话13812345678"        -> 命中
+#   "我电话１３８１２３４５６７８"  -> 原来放过（全角数字 \w 为真，不被当噪声）
+_FW_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+def fold_digits(text: str) -> str:
+    """只折叠全角数字，保留其余字符原样。用于数字类模式的匹配。"""
+    return (text or "").translate(_FW_DIGITS)
+
+
 # 银行卡号（16-19 位连续数字，且不是手机号）
 BANK_CARD_PATTERN = re.compile(r"\b\d{16,19}\b")
 
@@ -123,8 +141,9 @@ def check_local(text: str, user_id: int, chat_id: int, blacklist_ids: set) -> Ve
         ratio = invisible_ratio(t)
         return Verdict(True, f"不可见字符混淆（占比 {ratio:.0%}）")
 
-    # 3. 手机号
-    if PHONE_PATTERN.search(t):
+    # 3. 手机号（含全角数字变体）
+    td = fold_digits(t)
+    if PHONE_PATTERN.search(td):
         return Verdict(True, "包含手机号")
 
     # 4. Telegram 引流链接
@@ -132,7 +151,7 @@ def check_local(text: str, user_id: int, chat_id: int, blacklist_ids: set) -> Ve
         return Verdict(True, "包含 Telegram 引流链接")
 
     # 5. 银行卡号（先排除已被手机号规则覆盖的情况）
-    if not PHONE_PATTERN.search(t) and BANK_CARD_PATTERN.search(t):
+    if not PHONE_PATTERN.search(td) and BANK_CARD_PATTERN.search(td):
         return Verdict(True, "包含银行卡号")
 
     return _NO_HIT
