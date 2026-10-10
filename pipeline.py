@@ -446,6 +446,22 @@ class ChatPipeline:
 
     # -- 判定 -------------------------------------------------------------
 
+    def _delete_threshold(self, msg: PendingMessage, cut: float) -> float:
+        """这条消息的删删阈值。
+
+        **必须只有一个来源。** 早先判定与举报回填各写了一遍算法，
+        而只有判定那处应用了波次收紧——结果是波次期间被采纳的举报
+        会被误判为 dismiss（举报人看到"已驳回"，实际消息已被删）。
+        """
+        # 付费商家用更高的门槛：只删"铁证"级广告（诈骗/黑产/外部推销），
+        # 放过他们付费购买的招揽权。否则白名单等于投毒通道。
+        threshold = max(cut, ADVERTISER_CUT) if msg.whitelist == "advertiser" else cut
+        # 波次期间收紧：广告正在批量涌入，宁可多删也不漏。
+        # 幅度刻意保守（0.10），避免攻击者故意制造"假波次"来诱导误伤。
+        if self._raid.in_raid():
+            threshold = max(0.30, threshold - 0.10)
+        return threshold
+
     async def _judge(self, batch: list[PendingMessage]) -> None:
         cfg = self._cfg()
         if not cfg:
@@ -560,13 +576,7 @@ class ChatPipeline:
             conf = scores.get(m.row_id)
             if conf is None:
                 continue
-            # 付费商家用更高的门槛：只删"铁证"级广告（诈骗/黑产/外部推销），
-            # 放过他们付费购买的招揽权。否则白名单等于投毒通道。
-            threshold = max(cut, ADVERTISER_CUT) if m.whitelist == "advertiser" else cut
-            # 波次期间收紧判定：广告正在批量涌入，宁可多删也不漏。
-            # 幅度刻意保守（0.10），避免攻击者故意制造"假波次"来诱导误伤。
-            if self._raid.in_raid():
-                threshold = max(0.30, threshold - 0.10)
+            threshold = self._delete_threshold(m, cut)
             is_spam = conf >= threshold
             verdicts.append(Verdict(m, is_spam, conf, "llm"))
 
@@ -578,8 +588,9 @@ class ChatPipeline:
             conf = scores.get(m.row_id)
             if conf is None:
                 continue
-            threshold = (max(cut, ADVERTISER_CUT)
-                         if m.whitelist == "advertiser" else cut)
+            # 必须用与判定同一个阈值函数。早先这里独立算了一遍且漏了波次收紧，
+            # 导致波次期间"消息已删但举报显示已驳回"，举报人看到的结果是错的。
+            threshold = self._delete_threshold(m, cut)
             await asyncio.to_thread(
                 db.mark_report_reviewed, rid,
                 "delete" if conf >= threshold else "dismiss",

@@ -1553,25 +1553,29 @@ def add_pattern(chat_id: int | None, pattern: str, mode: str = "shadow") -> None
     execute("""INSERT INTO spam_patterns (chat_id, pattern, mode) VALUES (?,?,?)
                ON CONFLICT(chat_id, pattern) DO NOTHING""",
             (chat_id, pattern, mode))
-    _invalidate_pattern_cache()
+    _refresh_local_pattern_cache()
 
 
-def _invalidate_pattern_cache() -> None:
-    """让规则缓存立即失效。
+def _refresh_local_pattern_cache() -> None:
+    """刷新**当前进程**的规则缓存。
 
-    没有这一步会有一个隐蔽的滞后：load_patterns() 有 300 秒 TTL，
-    而 add_pattern/promote_pattern 写完库不通知缓存——
-    于是新规则最多要等 5 分钟才生效。
-    更糟的是 learner 在**另一个进程**（manage.py 或定时任务）里跑，
-    它调用 load_patterns(force=True) 只刷新了自己进程的缓存，
-    服务端进程的缓存完全不知情。
-    实测踩到：验证脚本里新加的 shadow 规则命中恒为 0。
+    ⚠️ 边界要说清楚：这只对本进程有效，**不会**让服务端进程立刻看到变化。
+    learner 通常跑在独立进程（manage.py 或定时任务）里，它调这个函数
+    刷的是自己的缓存，服务端完全不知情。
+
+    服务端能拿到新规则的路径有两条：
+      · load_patterns() 的 300 秒 TTL（每次判定都会检查并到期重载）
+      · job_self_evolve 在毕业之后的显式 load_patterns(force=True)
+    所以毕业后最多 5 分钟生效——能工作，但不是"立即"。
+
+    早先这个函数叫 _invalidate_pattern_cache，名字让人以为它跨进程生效，
+    实际不能。名字和注释如实描述比"看起来更强"重要。
     """
     try:
         import detector_rules
         detector_rules.load_patterns(force=True)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("刷新本进程规则缓存失败: %s", exc)
 
 
 def bump_pattern(pattern: str, shadow_hit: bool, spam_hit: bool) -> None:
@@ -1585,7 +1589,7 @@ def bump_pattern(pattern: str, shadow_hit: bool, spam_hit: bool) -> None:
 
 def promote_pattern(pattern_id: int) -> None:
     execute("UPDATE spam_patterns SET mode='active' WHERE id=?", (pattern_id,))
-    _invalidate_pattern_cache()
+    _refresh_local_pattern_cache()
 
 
 def fewshots(chat_id: int, kind: str, limit: int = 8) -> list[str]:

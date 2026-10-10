@@ -1129,6 +1129,59 @@ async def main():
 
     print("  计数: count_all_deletions=%d" % db.count_all_deletions(24))
 
+    print("=== 29. 回归：带按钮的消息能走通 submit（managed 未定义已修）===")
+    # 这个 bug 是代码简化时用静态分析发现的：submit 里
+    #   `bv = check_inline_buttons(..., managed)` 在第 333 行，
+    #   而 `managed = await self._managed_links()` 在第 342 行——
+    #   带按钮的消息会直接 NameError。
+    # 而"正文干净、广告在按钮里"正是我们为对付某类广告加的防线，
+    # 等于该防线从未真正生效。
+    # 现有测试只测了 check_inline_buttons 函数本身，没走 pipeline，
+    # 所以抓不到。这里补上端到端覆盖。
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
+    cidB = -999
+    db.register_chat(cidB, "按钮路径测试群", "general", shadow_mode=False)
+    db.set_chat_field(cidB, "shadow_mode", 0)
+    db.set_chat_field(cidB, "username", "btngroup")
+    db.set_chat_field(cidB, "managed_links", "btngroup,ourchannel")
+
+    pB = ChatPipeline(cidB, Graded({}), noop, None)
+
+    # (a) 消息带按钮、正文干净 -> 必须能走通（不抛 NameError）
+    rid = db.save_message(cidB, 9950, 71, "广告号", "进来看看", None, "t")
+    m = PendingMessage(rid, 9950, cidB, 71, "广告号", "进来看看", None, "t")
+    m.button_texts = ["加入频道"]
+    m.button_urls = ["https://t.me/spamchannel"]
+    try:
+        v = await pB.submit(m)
+        print("  (a) 带外部频道按钮 -> 判定=%s reason=%s"
+              % ("删除" if (v and v.is_spam) else "放过", v.reason if v else ""))
+        assert v and v.is_spam, "指向外部频道的按钮应被判删"
+        print("      ✓ 走通 submit，未出现 NameError")
+    except NameError as exc:
+        raise AssertionError("submit 在按钮路径上抛 NameError（managed 未定义）: %s"
+                             % exc)
+
+    # (b) 自家频道按钮 -> 放行（不能因为按钮就误删）
+    rid = db.save_message(cidB, 9951, 72, "运营", "本期榜单已更新", None, "t")
+    m2 = PendingMessage(rid, 9951, cidB, 72, "运营", "本期榜单已更新", None, "t")
+    m2.button_texts = ["查看榜单"]
+    m2.button_urls = ["https://t.me/ourchannel"]
+    v2 = await pB.submit(m2)
+    print("  (b) 自家频道按钮 -> 判定=%s（应放过）"
+          % ("删除" if (v2 and v2.is_spam) else "放过"))
+    assert not (v2 and v2.is_spam), "自家频道按钮不该被判删"
+
+    # (c) 纯引导文案按钮（无 URL）-> 也应命中
+    rid = db.save_message(cidB, 9952, 73, "广告号2", "看这里", None, "t")
+    m3 = PendingMessage(rid, 9952, cidB, 73, "广告号2", "看这里", None, "t")
+    m3.button_texts = ["领取福利"]
+    v3 = await pB.submit(m3)
+    print("  (c) 纯引导文案按钮 -> 判定=%s reason=%s"
+          % ("删除" if (v3 and v3.is_spam) else "放过", v3.reason if v3 else ""))
+    assert v3 and v3.is_spam, "广告引导按钮应被判删"
+
     os.unlink(tmp)
     print("\n全部通过")
 

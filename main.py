@@ -615,6 +615,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user = update.effective_user
 
     if user.is_bot:
+        # 静默丢弃会形成观测盲区：若群里有别的机器人在发广告，
+        # 我们既看不到也拦不住。实测库里 0 条 bot 消息，所以这条日志
+        # 平时不会出现；一旦出现就是值得看一眼的信号。
+        logger.info("跳过机器人消息 chat=%s msg=%s sender=%r(%s) text=%r",
+                    chat.id, msg.message_id, user.full_name, user.id,
+                    (msg.text or msg.caption or "")[:60])
         return
 
     # ── 编辑消息：必须重新判定 ──────────────────────────────────────
@@ -698,6 +704,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # 用带 TTL 的本地缓存，绝不能每条消息都调 get_chat_administrators——
     # 那是一次 Telegram API 往返，会直接拖垮吞吐。
     if await _is_cached_admin(chat.id, user.id):
+        await asyncio.to_thread(db.mark_checked, [row_id])
         return
 
     # 提取链接预览信息。正文可能只有一个字母，但预览目标是下发的，
