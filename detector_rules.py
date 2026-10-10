@@ -173,6 +173,54 @@ def repeat_key(text: str) -> str:
     return _NONCE_TAIL_PATTERN.sub("", norm) or norm
 
 
+# 纯 ASCII 字母/数字的极短消息。正常群友不会**反复**发这种内容——
+# 中文聊天里的短回应是「在的」「好的」「嗯」，不是裸字母。
+_BARE_LETTER_PATTERN = re.compile(r"^[A-Za-z0-9]{1,2}$")
+
+# 常见英文回应词白名单。ok/hi/no 这类在正常聊天里确实会出现，
+# 若把它们算进裸字母刷屏会误伤。它们本身也没有广告价值。
+_BARE_LETTER_ALLOW = frozenset({
+    "ok", "no", "hi", "up", "dd", "gg", "3q", "88", "66", "thx",
+})
+
+# 触发所需的历史次数。实测线上广告号每 5-7 分钟发一个字母，10 分钟内
+# 能攒到 2-3 个；正常用户几乎为 0，所以阈值取 3 已经很保守。
+BARE_LETTER_THRESHOLD = 3
+
+
+def is_bare_letter(text: str) -> bool:
+    t = (text or "").strip()
+    if t.lower() in _BARE_LETTER_ALLOW:
+        return False
+    return bool(_BARE_LETTER_PATTERN.match(t))
+
+
+def check_bare_letter_spam(text: str, recent_texts: list[str],
+                           threshold: int = BARE_LETTER_THRESHOLD) -> Verdict:
+    """单字母/双字符刷屏检测。
+
+    实测案例（2026-10-10，南京苏州集团）：
+      账号 A: n d d d n n d d m d n d d m   （14 条，每 5-7 分钟一条）
+      账号 B: u t o t o t                    （6 条，与 A 交叉插队）
+    两个账号都在发单个 ASCII 字母，被删记录均为 0，全部漏过。
+
+    这类消息本身不含广告特征——真正的广告在**频道预览卡片**里
+    （客户端显示 "📢 频道名 + 招募探花…"），而 bot 只收到那个字母。
+    但**发单字母的行为本身就是强特征**：正常群友不会这么干。
+
+    这条规则同时覆盖两种变体：
+      · 拆字：把一句话拆成单字分多条发（规避整句关键词匹配）
+      · 单字母 + 链接预览：用字母当载体，广告在预览里
+    """
+    t = (text or "").strip()
+    if not is_bare_letter(t):
+        return _NO_HIT
+    n = sum(1 for h in recent_texts if is_bare_letter(h))
+    if n + 1 >= threshold:
+        return Verdict(True, f"单字符刷屏（近期共 {n + 1} 条裸字母）")
+    return _NO_HIT
+
+
 def check_repeat(text: str, recent_texts: list[str], threshold: int = 3) -> Verdict:
     """重复刷屏检测。
 

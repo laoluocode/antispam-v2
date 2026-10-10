@@ -204,6 +204,19 @@ CREATE TABLE IF NOT EXISTS spam_reports (
 CREATE INDEX IF NOT EXISTS idx_report_chat ON spam_reports (chat_id, reviewed);
 CREATE INDEX IF NOT EXISTS idx_report_reporter ON spam_reports (reporter_id, created_at);
 
+-- 被丢弃的消息（诊断用，回答"为什么这条没被处理"）
+CREATE TABLE IF NOT EXISTS dropped_messages (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id    INTEGER,
+    chat_title TEXT,
+    user_id    INTEGER,
+    full_name  TEXT,
+    text       TEXT,
+    reason     TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_dropped_time ON dropped_messages (created_at);
+
 -- 举报额度用量（每人每日）
 CREATE TABLE IF NOT EXISTS report_usage (
     usage_date TEXT NOT NULL,
@@ -450,6 +463,27 @@ def user_stats(chat_id: int, user_id: int) -> dict:
 # --------------------------------------------------------------------------
 # 消息
 # --------------------------------------------------------------------------
+
+def save_dropped(chat_id: int, chat_title: str | None, user_id: int,
+                 full_name: str | None, text: str, reason: str) -> None:
+    """记录被丢弃的消息，用于回答"为什么这条广告没被处理"。"""
+    execute("""INSERT INTO dropped_messages
+               (chat_id, chat_title, user_id, full_name, text, reason)
+               VALUES (?,?,?,?,?,?)""",
+            (chat_id, chat_title, user_id, full_name, (text or "")[:400], reason))
+
+
+def recent_dropped(limit: int = 30) -> list[sqlite3.Row]:
+    return query("""SELECT * FROM dropped_messages
+                    ORDER BY id DESC LIMIT ?""", (limit,))
+
+
+def dropped_summary(since_hours: int = 24) -> list[sqlite3.Row]:
+    cutoff = (datetime.now() - timedelta(hours=since_hours)).strftime("%Y-%m-%d %H:%M:%S")
+    return query("""SELECT reason, COUNT(*) n FROM dropped_messages
+                    WHERE created_at >= ? GROUP BY reason ORDER BY n DESC""",
+                 (cutoff,))
+
 
 def save_message(chat_id: int, message_id: int, user_id: int, full_name: str,
                  text: str, reply_to: int | None, timestamp: str) -> int | None:

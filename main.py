@@ -535,16 +535,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     # 群组以外不处理（频道等）
     if chat.type not in ("group", "supergroup"):
+        logger.info("跳过非群组消息 chat=%s type=%s", chat.id, chat.type)
         return
 
     row = await asyncio.to_thread(db.get_chat, chat.id)
     if not row or not row["is_active"]:
-        logger.debug("未注册的群 chat=%s title=%s", chat.id, chat.title)
+        # 这是最危险的静默丢弃点：群已加入但未注册（my_chat_member 事件丢失、
+        # 或注册被停用），此时消息全部被丢弃而日志里毫无痕迹，
+        # 表现为"机器人不工作"但看不出原因。
+        logger.warning("丢弃消息：群未注册 chat=%s title=%r user=%s",
+                       chat.id, chat.title, user.id)
+        try:
+            await asyncio.to_thread(db.save_dropped, chat.id, chat.title,
+                                    user.id, user.full_name,
+                                    msg.text or msg.caption or "",
+                                    "chat_not_registered")
+        except Exception:  # noqa: BLE001
+            pass
         return
 
     text = msg.text or msg.caption
     if not text:
+        logger.info("跳过无文本消息 chat=%s msg=%s（纯媒体，无 caption）",
+                    chat.id, msg.message_id)
         return
+
+    # 诊断：极短文本 + 带转发/链接预览的消息，客户端显示的卡片内容与
+    # bot 收到的 text 可能完全不同（实测：客户端看到频道广告卡片，
+    # bot 只收到单个字母 't'）。这类场景要能看到完整结构才查得动。
+    if len(text.strip()) <= 3:
+        origin = getattr(msg, "forward_origin", None)
+        logger.warning(
+            "低信息量消息 chat=%s msg=%s text=%r "
+            "is_auto_fwd=%s forward_origin=%s "
+            "entities=%s link_preview=%s reply_to=%s",
+            chat.id, msg.message_id, text,
+            getattr(msg, "is_automatic_forward", None),
+            type(origin).__name__ if origin else None,
+            [(e.type, e.offset, e.length, getattr(e, "url", None))
+             for e in (msg.entities or [])],
+            bool(getattr(msg, "link_preview_options", None)),
+            msg.reply_to_message.message_id if msg.reply_to_message else None,
+        )
 
     ts = msg.date.astimezone(TZ).strftime("%Y-%m-%d %H:%M:%S")
 

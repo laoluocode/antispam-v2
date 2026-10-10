@@ -264,6 +264,50 @@ async def main():
     print("  recent_spam_records_all 可取:", n, "条")
     assert n >= 1
 
+    print("=== 13. 回归：单字符刷屏（线上实测漏判案例）===")
+    from detector_rules import check_bare_letter_spam, is_bare_letter
+
+    # 线上真实序列：账号 A 发 n d d d n n d d m d n d d，账号 B 发 u t o t o t
+    A = ["n", "d", "d", "d", "n", "n", "d", "d", "m", "d", "n", "d", "d"]
+    hit_at = None
+    for i, t in enumerate(A):
+        if check_bare_letter_spam(t, A[:i]).hit:
+            hit_at = i + 1
+            break
+    print("  广告号序列在第 %s 条命中（阈值 3）" % hit_at)
+    assert hit_at == 3, "应在第 3 条裸字母时命中"
+
+    # 后续每条都应命中（持续刷屏）
+    tail_hits = sum(1 for i, t in enumerate(A[3:], 3)
+                    if check_bare_letter_spam(t, A[:i]).hit)
+    print("  后续 %d 条全部命中: %s" % (len(A) - 3, tail_hits == len(A) - 3))
+    assert tail_hits == len(A) - 3
+
+    # 常见英文回应不应算裸字母（否则误伤正常群友）
+    for w in ("ok", "hi", "no", "up", "dd", "88", "thx", "yes"):
+        assert not is_bare_letter(w), "%r 不该被算作裸字母" % w
+    print("  常见英文回应白名单生效: ok/hi/no/up/dd/88/thx/yes 均不触发")
+
+    # 中文短回应不该触发
+    for w in ("在的", "嗯", "好的", "收到", "在呢"):
+        assert not check_bare_letter_spam(w, ["在的", "嗯", "好的"]).hit, w
+    print("  中文短回应不触发: 在的/嗯/好的/收到/在呢")
+
+    # 受信任用户豁免
+    cid4 = -400
+    db.register_chat(cid4, "豁免测试群", "general", shadow_mode=False)
+    db.set_chat_field(cid4, "shadow_mode", 0)
+    for _ in range(40):
+        db.upsert_user_seen(cid4, 42, "老群友", None)
+    for i in range(5):
+        db.save_message(cid4, 8000 + i, 42, "老群友", "x", None, "t")
+    rid = db.save_message(cid4, 8100, 42, "老群友", "x", None, "t")
+    p13 = ChatPipeline(cid4, fake, noop, None)
+    v13 = await p13.submit(PendingMessage(rid, 8100, cid4, 42, "老群友", "x", None, "t"))
+    print("  受信任群友发裸字母: %s（应为 None=未判删）"
+          % ("命中" if (v13 and v13.is_spam) else "未命中"))
+    assert not (v13 and v13.is_spam), "trusted 用户应豁免单字符规则"
+
     os.unlink(tmp)
     print("\n全部通过")
 

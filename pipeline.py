@@ -31,6 +31,7 @@ from deepseek import DeepSeekClient, DeepSeekError, estimate_cost_yuan
 from detector_rules import (
     INVISIBLE_MIN_LENGTH,
     INVISIBLE_RATIO_THRESHOLD,
+    check_bare_letter_spam,
     check_local,
     check_repeat,
     compute_trust,
@@ -189,10 +190,16 @@ class ChatPipeline:
         blacklist = await asyncio.to_thread(db.blacklist_ids, self.chat_id)
         v = check_local(msg.text, msg.user_id, self.chat_id, blacklist)
         if not v.hit:
-            # 重复刷屏需要近期发言
+            # 以下检测都需要该用户的近期发言
             history = await self._history(msg.user_id)
             if history:
                 v = check_repeat(msg.text, history, REPEAT_THRESHOLD)
+            # 单字符刷屏：广告号用裸字母当载体，广告内容在频道预览里，
+            # bot 只能拿到字母本身（实测漏判案例）。
+            # 受信任群友豁免：真实群友之间偶尔发几个 ok/hi 很正常，
+            # 而这个规则是"宁可严格"型的行为特征，用信任档位兜住误伤。
+            if not v.hit and trust != "trusted":
+                v = check_bare_letter_spam(msg.text, history)
 
         if v.hit:
             await asyncio.to_thread(db.mark_checked, [msg.row_id])
