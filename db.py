@@ -68,6 +68,10 @@ CREATE TABLE IF NOT EXISTS chats (
     log_channel_id   INTEGER,                     -- 删除记录频道（0/NULL=不发）
     managed_links    TEXT,                        -- 本群体系的频道标识（逗号分隔）
                                                   -- 指向这些目标的 t.me 链接属正常
+    linked_chat_id   INTEGER,                     -- 本群绑定的频道 ID。
+                                                  -- 该频道的自动转发（is_automatic_forward）
+                                                  -- 是本群自己的内容，必须放行；
+                                                  -- 外部频道没有这个身份，照常判定。
     normal_words     TEXT,                        -- 本群正常话题词，逗号分隔
                                                   -- 防止把群内惯例词误判为广告
     blocked_words    TEXT,                        -- 本群明确要删的词，逗号分隔
@@ -327,6 +331,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
             ("blocked_words", "TEXT"),
             ("managed_links", "TEXT"),
             ("username", "TEXT"),
+            ("linked_chat_id", "INTEGER"),
         ],
         "spam_reports": [
             ("source", "TEXT DEFAULT 'in_group'"),
@@ -480,7 +485,7 @@ def set_chat_field(chat_id: int, field: str, value: Any) -> None:
         "notify_admin", "report_board", "report_min_rate", "fastlane_seconds",
         "batch_seconds", "batch_max", "daily_token_cap", "is_active",
         "report_limit", "log_channel_id", "normal_words", "blocked_words",
-        "managed_links", "username",
+        "managed_links", "username", "linked_chat_id",
     }
     if field not in allowed:
         raise ValueError(f"不允许修改字段: {field}")

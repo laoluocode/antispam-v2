@@ -133,8 +133,13 @@ async def _learn_managed_links(app: Application, chat_id: int) -> None:
     hints = db.mine_channel_hints(c.description, c.username)
     await asyncio.to_thread(db.set_chat_field, chat_id, "managed_links", hints)
     await asyncio.to_thread(db.set_chat_username, chat_id, c.username)
-    logger.info("群体系频道 chat=%s username=%s managed=%s",
-                chat_id, c.username, hints)
+    # 记录绑定频道 ID：该频道的自动转发是本群自己的内容，必须放行。
+    linked = getattr(c, "linked_chat_id", None)
+    if linked:
+        await asyncio.to_thread(db.set_chat_field, chat_id, "linked_chat_id",
+                                linked)
+    logger.info("群体系频道 chat=%s username=%s linked=%s managed=%s",
+                chat_id, c.username, linked, hints)
 
 
 async def _refresh_admins(app: Application, chat_id: int) -> set[int]:
@@ -602,10 +607,40 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
-    if not msg or not update.effective_chat or not update.effective_user:
+    if not msg or not update.effective_chat:
         return
 
     chat = update.effective_chat
+
+    # ── 本群绑定频道的自动转发：最早放行 ────────────────────────────
+    # 放在所有守卫之前，因为 Telegram 对频道来源的消息可能**不下发 from_user**，
+    # 那样会在下面的 effective_user 守卫处被静默丢弃，根本走不到判定逻辑。
+    # 必须先识别出"这是本群自己的频道内容"再谈其他。
+    if getattr(msg, "is_automatic_forward", False) and chat.type in (
+            "group", "supergroup"):
+        try:
+            crow = await asyncio.to_thread(db.get_chat, chat.id)
+        except Exception:  # noqa: BLE001
+            crow = None
+        linked = (crow["linked_chat_id"]
+                  if crow is not None and "linked_chat_id" in crow.keys() else None)
+        sender = getattr(msg, "sender_chat", None)
+        sender_id = getattr(sender, "id", None)
+        if linked and sender_id and sender_id == linked:
+            logger.info("放行绑定频道自动转发 chat=%s msg=%s channel=%s(%s)",
+                        chat.id, msg.message_id,
+                        getattr(sender, "title", ""), sender_id)
+            return
+        # 不是本群绑定频道 -> 继续走判定（外部频道的自动转发该删就删）
+        logger.warning(
+            "自动转发非本群绑定频道 chat=%s msg=%s linked=%s sender=%s(%s)",
+            chat.id, msg.message_id, linked,
+            getattr(sender, "title", None), sender_id)
+
+    if not update.effective_user:
+        logger.info("跳过无 from_user 的消息 chat=%s msg=%s", chat.id,
+                    msg.message_id)
+        return
     user = update.effective_user
 
     if user.is_bot:

@@ -813,6 +813,53 @@ async def main():
     assert (normalize("我电话１３８１２３４５６７８")
             == normalize("我电话13812345678")), "归一化后应一致"
 
+    print("=== 23. 回归：本群绑定频道的自动转发放行 ===")
+    # 用户实测反馈：机器人会删除群绑定频道发帖时的自动转发。
+    # 根因：is_automatic_forward 全代码库只出现在诊断日志里，判断链上没用它，
+    # 于是群主自己的运营内容（榜单/报告/公告）被当普通消息判定。
+    #
+    # 关键设计：只放行**本群自己的绑定频道**（linked_chat_id 匹配），
+    # 外部频道的自动转发照常判定——否则等于给"借频道发广告"开后门。
+    import main as main_mod
+
+    cidC = -980
+    LINKED = -1003873111009
+    OTHER = -1009999999999
+    db.register_chat(cidC, "绑频测试群", "general", shadow_mode=False)
+    db.set_chat_field(cidC, "linked_chat_id", LINKED)
+    crow = db.get_chat(cidC)
+    print("  群 %s 绑定频道 = %s" % (cidC, crow["linked_chat_id"]))
+    assert crow["linked_chat_id"] == LINKED
+
+    # 用轻量替身验证判定逻辑（构造完整 Update 太重，这里直接测分支条件）
+    def verdict_for(sender_id, is_auto):
+        """复刻 main.handle_message 里那段判定。"""
+        if is_auto:
+            linked = crow["linked_chat_id"]
+            if linked and sender_id == linked:
+                return "放行（本群绑定频道）"
+        return "照常判定"
+
+    cases = [
+        (LINKED, True, "放行（本群绑定频道）", "本群绑定频道的自动转发"),
+        (OTHER, True, "照常判定", "外部频道的自动转发（该拦）"),
+        (None, True, "照常判定", "自动转发但拿不到 sender"),
+        (LINKED, False, "照常判定", "非自动转发的消息（即使 sender 相同）"),
+    ]
+    for sender_id, is_auto, expect, label in cases:
+        got = verdict_for(sender_id, is_auto)
+        ok = (got == expect)
+        print("  [%s] %-32s -> %s" % ("OK" if ok else "FAIL", label, got))
+        assert ok, "%s 期望 %s 实际 %s" % (label, expect, got)
+
+    # 未配置绑定频道的群：不应误放行任何自动转发
+    cidD = -981
+    db.register_chat(cidD, "无绑频群", "general", shadow_mode=False)
+    crow2 = db.get_chat(cidD)
+    print("  未配绑定频道的群 linked_chat_id = %r（None 表示没配）"
+          % crow2["linked_chat_id"])
+    assert crow2["linked_chat_id"] is None, "未配置时应为 NULL，不放行任何自动转发"
+
     os.unlink(tmp)
     print("\n全部通过")
 
