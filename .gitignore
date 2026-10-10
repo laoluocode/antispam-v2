@@ -1,0 +1,10 @@
+# 生成的产物
+.venv/
+__pycache__/
+*.pyc
+# 评测产物（含生产库导出的真实聊天记录，不入库）
+eval_samples.jsonl
+eval_report.json
+*.db
+._*
+.DS_Store

@@ -48,6 +48,60 @@ class Verdict(NamedTuple):
 _NO_HIT = Verdict(False, "")
 
 
+def compute_trust(msg_n: int, del_n: int, span_days: float = 0.0) -> str:
+    """计算用户信任档位。这是**喂给模型的信号**，不是一条保护规则。
+
+    V1 的错误是把"发言多"写成硬编码的 `if total_count > 100: skip`，
+    后果有两个：漏掉刷量伪装的广告号，同时让 AI 完全看不到这个信息。
+
+    实测依据（生产库 12,470 名用户，114 天数据）：
+
+    | 信号 | 区分度 |
+    |---|---|
+    | 发言量 | 无效。发言 1000+ 的用户里广告号占比 2.4%，发言 <10 的是 1.7% |
+    | 删除比 del/msg | 极强。21.4% 的用户从未被删，24.3% 的用户删除比 >90% |
+
+    反例（发言量完全失效的证据）：
+        发言=458 被删=294 删除比=64%   "看本质 扒开现象"
+        发言=151 被删=111 删除比=74%   "梦小琪洪山开课"
+    这些按"发言>100 即老用户"的标准全在保护区内，实际是刷量伪装的广告号。
+
+    档位含义：
+    - trusted : 发言够多且删除比极低 -> prompt 标 [信任=高]
+    - repeat  : 删除比高且被删次数够多 -> 标 [信任=低]，并进快车道
+    - new     : 发言极少 -> 标 [新用户]，判定应更谨慎
+    - normal  : 无标注，由模型自行判断
+    """
+    ratio = del_n / msg_n if msg_n else 0.0
+
+    # 新人优先：发言极少时删除比不可信（发 1 条被删就是 100%）
+    if msg_n < 5:
+        return "new"
+
+    # 惯犯：要求被删次数足够多，避免"发 10 条被删 3 条"被误标为广告号
+    if del_n >= 10 and ratio >= 0.30:
+        return "repeat"
+
+    # 受信任：发言够多且删除比极低
+    if msg_n >= 30 and ratio < 0.05:
+        return "trusted"
+
+    return "normal"
+
+
+TRUST_LABELS = {
+    "trusted": "[信任=高]",
+    "repeat": "[信任=低]",
+    "new": "[新用户]",
+    "normal": "",
+}
+
+
+def trust_marker(trust: str) -> str:
+    """prompt 中显示的信任标记。normal 档返回空串。"""
+    return TRUST_LABELS.get(trust, "")
+
+
 def check_local(text: str, user_id: int, chat_id: int, blacklist_ids: set) -> Verdict:
     """L0 检查。任何一项命中即返回删除判定。
 

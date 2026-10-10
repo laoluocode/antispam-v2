@@ -27,7 +27,7 @@ from collections import Counter, defaultdict
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from deepseek import DeepSeekClient, DeepSeekError, Usage, estimate_cost_yuan
-from detector_rules import check_local
+from detector_rules import check_local, trust_marker
 from prompts import BATCH_INSTRUCTION, GLOBAL_PROMPT, build_group_profile
 
 logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -35,11 +35,20 @@ logger = logging.getLogger("eval")
 
 
 def build_batch_messages(rows: list[dict], chat_title: str) -> list[dict]:
-    """按生产格式构造请求。前缀稳定，批次在最后一条。"""
+    """按生产格式构造请求。前缀稳定，批次在最后一条。
+
+    信任标记来自样本自带的字段（导出时按生产规则算好），
+    这样评测才能验证"信任信号到底有没有用"。
+    """
     lines = []
     for r in rows:
         text = (r["text"] or "").replace("\n", " ")
-        lines.append(f"[ID={r['msg_id']}] [发言数=50] 昵称=群友 | 内容={text} | 历史:无")
+        trust = r.get("trust", "normal")
+        marker = trust_marker(trust)
+        prefix = f"[ID={r['msg_id']}]"
+        if marker:
+            prefix += f" {marker}"
+        lines.append(f"{prefix} 昵称=群友 | 内容={text} | 历史:无")
 
     return [
         {"role": "system", "content": GLOBAL_PROMPT},
@@ -88,7 +97,7 @@ async def run_once(
 
         for v in parsed.get("verdicts", []):
             try:
-                predictions[int(v["id"])] = v.get("level", "none")
+                predictions[int(v["id"])] = float(v.get("confidence", 0.0))
             except (KeyError, TypeError, ValueError):
                 continue
 
@@ -110,7 +119,7 @@ async def run_once(
                 usage_total.add(usage)
                 for v in parsed.get("verdicts", []):
                     try:
-                        predictions[int(v["id"])] = v.get("level", "none")
+                        predictions[int(v["id"])] = float(v.get("confidence", 0.0))
                     except (KeyError, TypeError, ValueError):
                         continue
             except DeepSeekError as exc:
@@ -128,11 +137,13 @@ async def run_once(
     }
 
 
-def score(rows: list[dict], result: dict, strict: bool = True) -> dict:
-    """计算混淆矩阵。strict=True 时只有 high 才判为广告（严格档语义）。"""
+def score(rows: list[dict], result: dict, threshold: float) -> dict:
+    """按置信度阈值计算混淆矩阵。
+
+    预测为广告 = L0 命中 或 置信度 >= threshold。
+    """
     preds = result["predictions"]
     l0 = result["l0_hits"]
-    positive_level = "high" if strict else "medium"
 
     tp = fp = fn = tn = 0
     fp_samples, fn_samples = [], []
@@ -144,21 +155,18 @@ def score(rows: list[dict], result: dict, strict: bool = True) -> dict:
         if mid in l0:
             predicted_spam = True
         else:
-            level = preds.get(mid)
-            if level is None:
-                # 未判定（API 失败）——不计入，单独统计
-                continue
-            predicted_spam = level == positive_level or (
-                not strict and level in ("high", "medium")
-            )
+            conf = preds.get(mid)
+            if conf is None:
+                continue  # 未判定（API 失败），不计入
+            predicted_spam = conf >= threshold
 
         if actual_spam and predicted_spam:
             tp += 1
-        elif actual_spam and not predicted_spam:
+        elif actual_spam:
             fn += 1
             if len(fn_samples) < 12:
                 fn_samples.append(r["text"][:70])
-        elif not actual_spam and predicted_spam:
+        elif predicted_spam:
             fp += 1
             if len(fp_samples) < 12:
                 fp_samples.append(r["text"][:70])
@@ -170,11 +178,59 @@ def score(rows: list[dict], result: dict, strict: bool = True) -> dict:
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0
 
     return {
+        "threshold": threshold,
         "tp": tp, "fp": fp, "fn": fn, "tn": tn,
         "precision": precision, "recall": recall, "f1": f1,
         "fp_samples": fp_samples, "fn_samples": fn_samples,
         "l0_count": len(l0),
+        "by_trust": _by_trust(rows, result, threshold),
     }
+
+
+def _by_trust(rows: list[dict], result: dict, threshold: float) -> dict:
+    """按信任档位分层统计，用于验证信任信号是否真的起作用。
+
+    如果 [信任=高] 组的精确率明显更高，说明信号有效。
+    如果 [信任=低] 组的召回率没有提升，说明信号没用上。
+    """
+    preds = result["predictions"]
+    l0 = result["l0_hits"]
+    groups: dict[str, dict] = {}
+
+    for r in rows:
+        mid = r["msg_id"]
+        g = groups.setdefault(r.get("trust", "normal"),
+                              {"tp": 0, "fp": 0, "fn": 0, "tn": 0, "n": 0})
+        g["n"] += 1
+        actual_spam = r["label"] == "spam"
+        if mid in l0:
+            predicted_spam = True
+        else:
+            conf = preds.get(mid)
+            if conf is None:
+                continue
+            predicted_spam = conf >= threshold
+
+        if actual_spam and predicted_spam:
+            g["tp"] += 1
+        elif actual_spam:
+            g["fn"] += 1
+        elif predicted_spam:
+            g["fp"] += 1
+        else:
+            g["tn"] += 1
+
+    out = {}
+    for k, g in groups.items():
+        p = g["tp"] / (g["tp"] + g["fp"]) if (g["tp"] + g["fp"]) else 0.0
+        rc = g["tp"] / (g["tp"] + g["fn"]) if (g["tp"] + g["fn"]) else 0.0
+        out[k] = {**g, "precision": p, "recall": rc}
+    return out
+
+
+def sweep(rows: list[dict], result: dict, thresholds) -> list[dict]:
+    """扫描阈值，返回各切点的指标。用于用数据选阈值而非凭感觉。"""
+    return [score(rows, result, t) for t in thresholds]
 
 
 async def main() -> None:
@@ -184,6 +240,8 @@ async def main() -> None:
     ap.add_argument("--runs", type=int, default=2)
     ap.add_argument("--limit", type=int, default=0, help="限制样本数（0=全部）")
     ap.add_argument("--chat-title", default="测试群")
+    ap.add_argument("--threshold", type=float, default=0.85,
+                    help="选定阈值，默认 0.85（严格档）")
     ap.add_argument("--out", default="eval_report.json")
     args = ap.parse_args()
 
@@ -203,18 +261,32 @@ async def main() -> None:
     n_ham = len(rows) - n_spam
     print("=" * 78)
     print(f"  离线评测  样本 {len(rows)} 条（广告 {n_spam} / 正常 {n_ham}）")
-    print(f"  批次大小 {args.batch_size}  运行 {args.runs} 轮  严格档（仅 high 删除）")
+    print(f"  批次大小 {args.batch_size}  运行 {args.runs} 轮  选定阈值 {args.threshold}")
     print("=" * 78)
 
     async with DeepSeekClient(api_key=key) as client:
         for run_idx in range(1, args.runs + 1):
             print(f"\n--- 第 {run_idx} 轮 ---")
             result = await run_once(client, rows, args.batch_size, args.chat_title)
-            sc = score(rows, result, strict=True)
             usage = result["usage"]
 
+            thresholds = [0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.85, 0.9, 0.95]
+            table = sweep(rows, result, thresholds)
+
+            print(f"\n  阈值扫描（预测为广告 = 置信度 >= 阈值）:")
+            print(f"  {'阈值':>6} {'精确率':>8} {'召回率':>8} {'F1':>7}  {'TP':>5} {'FP':>5} {'FN':>5}")
+            print("  " + "-" * 58)
+            for t in table:
+                print(f"  {t['threshold']:>6.2f} {t['precision']:>7.1%} {t['recall']:>7.1%} "
+                      f"{t['f1']:>7.3f}  {t['tp']:>5} {t['fp']:>5} {t['fn']:>5}")
+
+            # 选定阈值：默认严格档 0.85
+            chosen = args.threshold
+            sc = score(rows, result, chosen)
+
             l0_n = sc["l0_count"]
-            print(f"\n  L0 规则拦截      : {l0_n} 条（占 {l0_n/len(rows):.1%}，未进 LLM）")
+            print(f"\n  === 选定阈值 {chosen} ===")
+            print(f"  L0 规则拦截      : {l0_n} 条（占 {l0_n/len(rows):.1%}，未进 LLM）")
             err_note = f"，失败 {result['errors']} 批" if result["errors"] else ""
             unj = result.get("unjudged", 0)
             if unj:
@@ -235,6 +307,15 @@ async def main() -> None:
             print(f"  单条成本         : {per_msg:.6f} 元")
             print(f"  外推 1500 条/天  : {per_msg*1500:.3f} 元/天 ≈ {per_msg*1500*30:.2f} 元/月/群")
 
+            print(f"\n  按信任档位分层（验证信任信号是否有效）:")
+            print(f"  {'档位':10s} {'样本':>5} {'精确率':>8} {'召回率':>8}")
+            print("  " + "-" * 36)
+            for k in ("trusted", "normal", "new", "repeat"):
+                g = sc["by_trust"].get(k)
+                if not g:
+                    continue
+                print(f"  {k:10s} {g['n']:>5} {g['precision']:>7.1%} {g['recall']:>7.1%}")
+
             if sc["fp_samples"]:
                 print(f"\n  ⚠️  误删样本（判 high 实为正常，需人工复核）:")
                 for s in sc["fp_samples"]:
@@ -247,7 +328,11 @@ async def main() -> None:
             if run_idx == args.runs:
                 report = {
                     "samples": len(rows), "spam": n_spam, "ham": n_ham,
-                    "batch_size": args.batch_size, "strict": True,
+                    "batch_size": args.batch_size, "threshold": chosen,
+                    "threshold_sweep": [
+                        {k: v for k, v in t.items() if k not in ("fp_samples", "fn_samples")}
+                        for t in table
+                    ],
                     "l0_hits": result["l0_hits"], "l0_count": sc["l0_count"],
                     "llm_count": result["llm_count"],
                     "batches": result["batches"], "errors": result["errors"],

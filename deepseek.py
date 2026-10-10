@@ -38,9 +38,10 @@ logger = logging.getLogger(__name__)
 # 官方并发限制：deepseek-flash 为 2500（账号级），无需主动限流。
 # 但单请求超时需放宽——官方最长会保活 10 分钟。
 DEFAULT_TIMEOUT = 300.0
-# 输出上限。thinking 关闭后每条 verdict 约 12 token，
-# 200 条批次的纯 JSON 约 2.5k token；留足余量避免 finish_reason=length 截断。
-DEFAULT_MAX_TOKENS = 16000
+# 输出上限。改为置信度格式后每条 verdict 约 10 token
+# （实测 14 条 = 147 token），200 条批次约 2k token。
+# 截断有挽救机制兜底，这里留 4 倍余量即可。
+DEFAULT_MAX_TOKENS = 8000
 
 # 空响应重试次数。官方 JSON Output 偶发返回空 content，
 # 重试 2 次可覆盖绝大多数瞬时情况。
@@ -50,26 +51,6 @@ RETRY_BACKOFF_SECONDS = 2.0
 
 class DeepSeekError(RuntimeError):
     """调用失败。调用方必须保留消息待下轮重试，不可视为"无广告"。"""
-
-
-def parse_verdicts(content: str) -> dict[int, str]:
-    """从模型返回中提取 {记录ID: level}。
-
-    **容忍截断**：输出被 max_tokens 切断时，完整的那部分 verdict 依然有效。
-    逐个提取 `"id":N` 与紧随其后的 `"level":"X"`，不依赖整体 JSON 可解析。
-
-    这样做的意义：截断只会让**尾部若干条**缺少判定，由调用方重试这些具体消息；
-    而不是整批报废。若把截断当"无广告"处理，就成了静默漏删。
-    """
-    verdicts: dict[int, str] = {}
-    # 匹配 {"id":123,"level":"high",...}，允许字段间有空白
-    pattern = re.compile(
-        r'"id"\s*:\s*(-?\d+)\s*,\s*"level"\s*:\s*"(high|medium|none)"',
-        re.IGNORECASE,
-    )
-    for match in pattern.finditer(content or ""):
-        verdicts[int(match.group(1))] = match.group(2).lower()
-    return verdicts
 
 
 @dataclass
@@ -104,6 +85,7 @@ class Usage:
         return cls(
             prompt_tokens=raw.get("prompt_tokens", 0) or 0,
             completion_tokens=raw.get("completion_tokens", 0) or 0,
+            # 官方两个字段名互为别名，取其一即可（实测两者都存在）
             cache_hit_tokens=raw.get("prompt_cache_hit_tokens", 0) or 0,
             cache_miss_tokens=raw.get("prompt_cache_miss_tokens", 0) or 0,
             reasoning_tokens=details.get("reasoning_tokens", 0) or 0,
@@ -148,6 +130,32 @@ class DailyBudget:
     @property
     def remaining_ratio(self) -> float:
         return max(0.0, 1.0 - self.used / self.cap) if self.cap else 1.0
+
+
+def parse_verdicts(content: str) -> dict[int, float]:
+    """从模型返回中提取 {记录ID: 置信度}。
+
+    **容忍截断**：输出被 max_tokens 切断时，完整的那部分 verdict 依然有效。
+    逐个提取 `"id":N` 与紧随其后的 `"confidence":X`，不依赖整体 JSON 可解析。
+
+    这样做的意义：截断只会让**尾部若干条**缺少判定，由调用方重试这些具体消息；
+    而不是整批报废。若把截断当"无广告"处理，就成了静默漏删。
+    """
+    verdicts: dict[int, float] = {}
+    pattern = re.compile(
+        r'"id"\s*:\s*(-?\d+)\s*,\s*"confidence"\s*:\s*([0-9]*\.?[0-9]+)'
+    )
+    for match in pattern.finditer(content or ""):
+        try:
+            verdicts[int(match.group(1))] = float(match.group(2))
+        except (TypeError, ValueError):
+            continue
+    return verdicts
+
+
+def to_verdict_list(scores: dict[int, float]) -> list[dict]:
+    """把 {id: 置信度} 转回 verdicts 列表，供调用方统一处理。"""
+    return [{"id": rid, "confidence": conf} for rid, conf in scores.items()]
 
 
 class DeepSeekClient:
@@ -246,10 +254,7 @@ class DeepSeekClient:
                     call_usage.completion_tokens, len(salvaged),
                 )
                 return (
-                    {"verdicts": [
-                        {"id": rid, "level": lv, "reason": ""}
-                        for rid, lv in salvaged.items()
-                    ], "truncated": True},
+                    {"verdicts": to_verdict_list(salvaged), "truncated": True},
                     request_usage,
                 )
 
@@ -288,10 +293,7 @@ class DeepSeekClient:
                         len(salvaged), attempt + 1, exc,
                     )
                     return (
-                        {"verdicts": [
-                            {"id": rid, "level": lv, "reason": ""}
-                            for rid, lv in salvaged.items()
-                        ], "truncated": True},
+                        {"verdicts": to_verdict_list(salvaged), "truncated": True},
                         request_usage,
                     )
                 last_error = exc
