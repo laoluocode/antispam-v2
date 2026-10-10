@@ -80,9 +80,21 @@ MIN_SHADOW_HITS = 10
 # 每天最多毕业多少条规则，防止规则爆炸
 MAX_PROMOTIONS_PER_DAY = 3
 
-# 语料取材窗口与上限
+# 语料取材窗口与上限。
+#
+# 教训（来自 @BayesSpamSniperBot 作者的上线故障复盘）：他的机器人上线后
+# 误删严重，根因是训练集里垃圾广告远多于正常消息——分类器学成了"倾向判广告"。
+# 我们的闸门依赖正常消息语料，所以正常语料被**静默截断**会导致闸门失效，
+# 这是同一个失效模式。
+#
+# 实测：武汉档案馆群的正常消息已达 1,476 条（总量 2,985），逼近旧上限 3000。
+# 因此上限调到 20000（远超实际量级），并在被截断时**明确告警**而不是静默截断。
 CORPUS_DAYS = 7
-CORPUS_LIMIT = 3000
+CORPUS_LIMIT = 20000
+
+# 负样本相对正样本的最低倍数。低于它说明正常语料偏少，
+# 闸门的可靠性下降，此时跳过本轮学习并告警。
+MIN_HAM_PER_SPAM = 0.5
 
 # 候选短语长度范围（归一化后）
 MIN_PHRASE_LEN = 4
@@ -146,6 +158,12 @@ def load_corpus(chat_id: int, days: int = CORPUS_DAYS,
 
     注意负样本是"我们当前认为正常"的消息，其中可能混有漏网广告——
     这会让闸门偏严（好事），不会让误伤发生。
+
+    ⚠️ 两个必须防的失效模式：
+      1. **静默截断**：语料被 LIMIT 切掉一半，闸门就只覆盖了一半的正常消息，
+         零命中结论不可靠。这里在触及上限时明确告警。
+      2. **正常语料饥饿**：某些群广告占比极高（实测有群 385 删 / 26 留），
+         正常样本太少会让闸门的统计意义下降。调用方用 MIN_HAM_PER_SPAM 判断。
     """
     spam_rows = db.query("""
         SELECT text_snapshot FROM spam_records
@@ -165,6 +183,12 @@ def load_corpus(chat_id: int, days: int = CORPUS_DAYS,
                 AND s.action = 'delete')
         ORDER BY m.id DESC LIMIT ?
     """, (chat_id, f"-{days} days", limit))
+
+    if len(spam_rows) >= limit or len(ham_rows) >= limit:
+        logger.warning(
+            "语料触及上限 chat=%s spam=%d ham=%d limit=%d —— "
+            "闸门只覆盖了部分正常消息，结论可能不可靠",
+            chat_id, len(spam_rows), len(ham_rows), limit)
 
     return ([r["text_snapshot"] for r in spam_rows],
             [r["text"] for r in ham_rows])
@@ -353,6 +377,20 @@ def refresh_candidates(chat_id: int) -> dict:
     if not spam or not ham:
         return {"skipped": True, "reason": "语料不足",
                 "spam": len(spam), "ham": len(ham)}
+
+    # 正常语料饥饿保护。
+    # 借鉴 @BayesSpamSniperBot 上线故障的教训：他的训练集里广告远多于正常消息，
+    # 分类器学成"倾向判广告"，上线后大规模误删。
+    # 我们的闸门完全依赖正常语料——正常样本太少时"零命中"就失去了统计意义，
+    # 所以宁可不学，也不能在证据不足时放权。
+    ratio = len(ham) / max(1, len(spam))
+    if ratio < MIN_HAM_PER_SPAM:
+        logger.warning(
+            "正常语料饥饿 chat=%s spam=%d ham=%d 比值=%.2f < %.2f —— "
+            "闸门统计意义不足，本轮跳过学习",
+            chat_id, len(spam), len(ham), ratio, MIN_HAM_PER_SPAM)
+        return {"skipped": True, "reason": "正常语料不足（闸门不可靠）",
+                "spam": len(spam), "ham": len(ham), "ratio": round(ratio, 2)}
 
     cands = mine_all(spam, ham)
     passed = [c for c in cands if c.passes_gate()]

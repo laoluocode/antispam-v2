@@ -635,6 +635,40 @@ async def main():
           % (v and v.is_spam))
     assert v and v.is_spam, "免 AI 额度不能绕过 L0 确定性规则"
 
+    print("=== 19. 回归：语料健康（截断告警 / 正常语料饥饿保护）===")
+    # 借鉴 @BayesSpamSniperBot 上线故障：训练集里广告远多于正常消息
+    # -> 分类器学成"倾向判广告" -> 大规模误删。
+    # 我们的闸门依赖正常语料，同样会因正常样本过少而失去统计意义。
+    cidA = -960
+    db.register_chat(cidA, "饥饿测试群", "general", shadow_mode=False)
+    # 造 40 条广告、只有 3 条正常 -> 比值 0.075 < 0.5，应跳过
+    for i in range(40):
+        t = "广告文案样本 %d 加微" % i
+        db.save_message(cidA, 8000 + i, 1, "广告号", t, None, "2026-10-10 12:00:00")
+        db.save_spam_record(cidA, 1, "广告号", 8000 + i, t, 0.9, "llm", "delete")
+    for i in range(3):
+        db.save_message(cidA, 8100 + i, 2, "群友", "正常聊天 %d" % i, None,
+                        "2026-10-10 12:00:00")
+    st = learner.refresh_candidates(cidA)
+    print("  广告 40 / 正常 3（比值 0.08）-> %s" % st)
+    assert st.get("skipped"), "正常语料过少时必须跳过学习"
+    print("      -> 已跳过，不会在证据不足时放权 ✓")
+
+    # 补足正常语料后应恢复学习
+    for i in range(30):
+        db.save_message(cidA, 8200 + i, 2, "群友", "正常聊天补充 %d 内容" % i,
+                        None, "2026-10-10 12:00:00")
+    st = learner.refresh_candidates(cidA)
+    print("  补足正常语料后 -> skipped=%s spam=%s ham=%s"
+          % (st.get("skipped"), st.get("spam"), st.get("ham")))
+    assert not st.get("skipped"), "语料充足后应恢复学习"
+
+    # 上限告警：limit 设很小应触发告警（这里只验证不会静默）
+    sp, ha = learner.load_corpus(cidA, limit=5)
+    print("  load_corpus(limit=5) -> 返回 spam=%d ham=%d（并已告警，不静默）"
+          % (len(sp), len(ha)))
+    assert len(sp) <= 5 and len(ha) <= 5
+
     os.unlink(tmp)
     print("\n全部通过")
 
