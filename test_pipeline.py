@@ -1277,6 +1277,58 @@ async def main():
             "%s 应归一到同一结果，实际 %s" % (note, norms)
     print("  ✓ 变体归一一致")
 
+    print("=== 32. 回归：抽样复核要分层 + 批次化（两个交互层面的修正）===")
+    # 问题一（管理员实测反馈）："一次 40-50 条，在机器人端几乎无法操作"。
+    # 逐条发通知会把对话冲垮，实际结果是没人复核（上线至今 1844 次删除复核 1 次）。
+    # 问题二：均匀抽样几乎全是 0.9+ 的显然广告，对阈值标定**零信息量**。
+    cidR2 = -1003
+    db.register_chat(cidR2, "抽样分层测试群", "general", shadow_mode=False)
+    # 模拟线上分布：大量高分 + 少量边界样本
+    confs = ([0.95] * 60) + ([0.99] * 30) + ([0.55] * 6) + ([0.65] * 6)
+    for i, cf in enumerate(confs):
+        t = "分层样本 %d 内容" % i
+        db.save_message(cidR2, 20000 + i, 1, "广告号", t, None, "t")
+        db.save_spam_record(cidR2, 1, "广告号", 20000 + i, t, cf, "llm", "delete")
+
+    rows = db.sample_deletions(cidR2, 24, 30)
+    print("  抽样 %d 条（目标 30）" % len(rows))
+    near = sum(1 for r in rows if 0.5 <= r["confidence"] < 0.7)
+    mid = sum(1 for r in rows if 0.7 <= r["confidence"] < 0.9)
+    clear = sum(1 for r in rows if r["confidence"] >= 0.9)
+    print("    边界(0.5-0.7)=%d  中间(0.7-0.9)=%d  显然(>=0.9)=%d"
+          % (near, mid, clear))
+    assert near > 0, "分层抽样必须覆盖阈值边界——均匀抽样在这里恒为 0"
+    print("    ✓ 边界样本有覆盖（均匀抽样时线上比例 33:1，几乎抽不到）")
+
+    # 批次化：一次推送 + 翻页，而不是 N 条通知
+    items = [{"rec": r["id"], "chat": cidR2, "chat_name": "测试群",
+              "text": r["text_snapshot"], "conf": r["confidence"],
+              "source": r["source"]} for r in rows]
+    bid = db.create_review_batch(items)
+    print("  批次 ID=%s 条目=%d" % (bid, len(items)))
+    assert bid > 0
+    b = db.get_review_batch(bid)
+    assert b and len(b["items"]) == len(items), "批次应能完整取回"
+    page_size = 3
+    pages = (len(items) + page_size - 1) // page_size
+    print("  每页 %d 条 -> 共 %d 页（逐条发则要 %d 条消息）"
+          % (page_size, pages, len(items)))
+    assert pages < len(items), "批次化后消息数必须远少于逐条发"
+
+    # 逐条判定要立刻生效并写入记忆
+    t0 = items[0]["text"]
+    db.remember_verdict(cidR2, t0, "false_positive", "admin_review")
+    assert db.recall_verdict(cidR2, t0) == "false_positive"
+    variant = t0.replace("内容", "内容\u200b")     # 插零宽
+    assert db.recall_verdict(cidR2, variant) == "false_positive", \
+        "变体也要命中同一条记忆"
+    print("  ✓ 复核动作立刻写入判定记忆（含归一化变体）")
+
+    db.advance_review_batch(bid, 1, 1)
+    b = db.get_review_batch(bid)
+    assert b["cursor"] == 1 and b["done"] == 1
+    print("  ✓ 进度可推进（cursor=%s done=%s）" % (b["cursor"], b["done"]))
+
     os.unlink(tmp)
     print("\n全部通过")
 

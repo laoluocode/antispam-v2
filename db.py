@@ -280,6 +280,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_verdict_memory
 CREATE INDEX IF NOT EXISTS idx_verdict_memory_hash
     ON verdict_memory(norm_hash);
 
+-- 抽样复核批次。
+--
+-- 为什么要"批次"而不是逐条发通知：管理员实测反馈"一次 40-50 条，
+-- 在机器人端几乎无法操作"。逐条发 50 条消息会把对话冲垮，只能一条条点，
+-- 实际结果就是没人复核（上线以来 1844 次删除只被复核过 1 次）。
+-- 批次化后：一次推送一个入口，点进去一条条翻，每屏 3 条 + 固定 4 个按钮。
+CREATE TABLE IF NOT EXISTS review_batches (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL DEFAULT 0,
+    items       TEXT NOT NULL,             -- JSON: [{rec, chat, text, conf}]
+    cursor      INTEGER DEFAULT 0,         -- 当前翻到第几条
+    done        INTEGER DEFAULT 0,         -- 已处理的条数
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 全部判定记录（含"判定为正常"的）。
 --
 -- 为什么不能只用 spam_records 做分布分析：那张表只记删除/观察/恢复，
@@ -393,6 +408,7 @@ REQUIRED_TABLES = (
     "chat_fewshots", "spam_reports", "daily_report_stats", "token_usage",
     "report_usage", "dropped_messages", "preview_fingerprints",
     "preview_senders", "global_blacklist", "verdict_log", "verdict_memory",
+    "review_batches",
 )
 
 
@@ -971,33 +987,76 @@ def count_all_deletions(hours: int = 12) -> int:
     return row["n"] if row else 0
 
 
+# 抽样分层。**这是抽样复核有没有价值的关键。**
+#
+# 早先按"随机抽已删除的记录"实现，实测抽到的全是置信度 0.9-1.0 的显然广告：
+#   #698  [1.00] '帮收赌资 赚3千'
+#   #1399 [0.95] '出勤名单…'
+# 复核 30 条这样的样本，对"阈值 0.50 选得对不对"提供**零信息**——
+# 它们在 0.30 或 0.70 的阈值下都会被删。
+#
+# 真正有信息量的是**阈值附近**的判定：那里的每一条都在检验判断尺度，
+# 一条误删就能说明阈值偏低。所以按置信度分层，并把配额向边界倾斜。
+SAMPLE_BANDS = (
+    ("near_cut", "threshold-adjacent(0.5-0.7)", 0.50, 0.70, 0.5),
+    ("mid", "mid(0.7-0.9)", 0.70, 0.90, 0.3),
+    ("clear", "clear(>=0.9)", 0.90, 1.01, 0.2),
+)
+
+
 def sample_deletions(chat_id: int = 0, hours: int = 12,
                      limit: int = 5) -> list[sqlite3.Row]:
-    """随机抽取最近的删除记录，供管理员复核。
+    """分层抽样最近的删除记录，供管理员复核。
 
-    为什么需要（来自实际使用数据）：上线以来 1844 次删除，管理员只复核了 1 次。
-    这说明系统在"盲信"状态下运行——而"边用边更新"需要反馈才能更新。
-    复核率 0.05% 意味着反馈回路基本没闭合。
+    为什么需要（实际使用数据）：上线以来 1844 次删除，管理员只复核了 1 次。
+    系统在"盲信"状态下运行——而"边用边更新"需要反馈才能更新。
 
-    抽样比全量复核可行得多：每次只看几条，但能持续验证判定质量，
-    并且每一条"确实是广告/确实是误删"都会变成判定记忆或反例样本。
+    为什么分层：均匀抽样几乎全是 0.9+ 的显然广告，对阈值标定没有信息量。
+    配额向 0.5-0.7 的边界区间倾斜，因为那里的判断才真正需要人来确认。
     """
     where = ["action='delete'", "text_snapshot IS NOT NULL",
+             "confidence IS NOT NULL",
              "created_at >= datetime('now', ?)"]
     args: list = [f"-{hours} hours"]
     if chat_id:
         where.append("chat_id = ?")
         args.append(chat_id)
-    # 已抽样过的 ID 用字符串集合过滤（不写在 SQL 里——把逗号分隔串
-    # 拆成整数集合再 IN 会让 SQL 变得又长又脆，实测第一版就是这么写坏的）
+    clause = " AND ".join(where)
+
     sampled = sampled_ids()
-    rows = query(f"""
-        SELECT id, chat_id, user_id, full_name, text_snapshot, confidence,
-               source, created_at
-        FROM spam_records WHERE {' AND '.join(where)}
-        ORDER BY RANDOM() LIMIT ?
-    """, (*args, max(limit * 4, 20)))
-    return [r for r in rows if r["id"] not in sampled][:limit]
+    out: list = []
+    seen: set[int] = set()
+    for _key, _label, lo, hi, share in SAMPLE_BANDS:
+        quota = max(1, int(limit * share))
+        rows = query(f"""
+            SELECT id, chat_id, user_id, full_name, text_snapshot, confidence,
+                   source, created_at
+            FROM spam_records
+            WHERE {clause} AND confidence >= ? AND confidence < ?
+            ORDER BY RANDOM() LIMIT ?
+        """, (*args, lo, hi, quota * 4))
+        picked = [r for r in rows if r["id"] not in sampled
+                  and r["id"] not in seen][:quota]
+        for r in picked:
+            seen.add(r["id"])
+        out.extend(picked)
+
+    # 若某一层样本不足，用其他层补齐，保证条数稳定
+    if len(out) < limit:
+        rows = query(f"""
+            SELECT id, chat_id, user_id, full_name, text_snapshot, confidence,
+                   source, created_at
+            FROM spam_records WHERE {clause}
+            ORDER BY RANDOM() LIMIT ?
+        """, (*args, limit * 4))
+        for r in rows:
+            if len(out) >= limit:
+                break
+            if r["id"] in seen or r["id"] in sampled:
+                continue
+            seen.add(r["id"])
+            out.append(r)
+    return out
 
 
 def sampled_ids() -> set[int]:
@@ -1010,6 +1069,33 @@ def sampled_ids() -> set[int]:
         if x.strip().isdigit():
             out.add(int(x))
     return out
+
+
+def create_review_batch(items: list[dict]) -> int:
+    """把一批待复核项存起来，返回批次 ID。"""
+    import json as _json
+    cur = execute("""INSERT INTO review_batches (items) VALUES (?)""",
+                  (_json.dumps(items, ensure_ascii=False),))
+    return cur or 0
+
+
+def get_review_batch(batch_id: int):
+    row = query_one("SELECT * FROM review_batches WHERE id=?", (batch_id,))
+    if not row:
+        return None
+    import json as _json
+    try:
+        row = dict(row)
+        row["items"] = _json.loads(row["items"] or "[]")
+        return row
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("复核批次 %s 解析失败: %s", batch_id, exc)
+        return None
+
+
+def advance_review_batch(batch_id: int, cursor: int, done: int) -> None:
+    execute("UPDATE review_batches SET cursor=?, done=? WHERE id=?",
+            (cursor, done, batch_id))
 
 
 def mark_sampled(record_ids: list[int]) -> None:

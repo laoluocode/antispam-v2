@@ -440,7 +440,7 @@ def _spam_keyboard(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
 MAX_DETAIL_NOTIFY = 6
 
 # 每次抽样复核推送几条
-SAMPLE_REVIEW_COUNT = 5
+SAMPLE_REVIEW_COUNT = 30
 
 async def _notify_spam(bot, verdicts: list[Verdict], shadow: bool) -> None:
     """逐条通知管理员，每条带自己的操作按钮。
@@ -1296,6 +1296,69 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"注意：消息本身已被删除，无法找回；"
             f"如该用户是长期误删对象，用 /wl 加入白名单。")
 
+    elif data.startswith("rvok_") or data.startswith("rvfp_") \
+            or data.startswith("rvad_"):
+        # 抽样复核的逐条判定。三种动作都会**立刻生效**并写入判定记忆，
+        # 这样同一条内容今后不必再判、也不必再打扰管理员。
+        parts = data.split("_")
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+            await query.answer("无效的复核请求", show_alert=True)
+            return
+        action, bid, idx = parts[0], int(parts[1]), int(parts[2])
+        batch = await asyncio.to_thread(db.get_review_batch, bid)
+        if not batch or idx >= len(batch["items"]):
+            await query.answer("该复核批次已失效", show_alert=True)
+            return
+        it = batch["items"][idx]
+        text = it.get("text") or ""
+
+        if action == "rvfp":
+            # 管理员说误删 -> 记入判定记忆，今后同类直接放行
+            if text:
+                await asyncio.to_thread(db.remember_verdict, it.get("chat"),
+                                        text, "false_positive", "admin_review")
+            await asyncio.to_thread(db.execute,
+                                    "UPDATE spam_records SET action='revive' "
+                                    "WHERE id=?", (it.get("rec"),))
+            note = "已记为误删，同类内容今后直接放行"
+        elif action == "rvad":
+            # 管理员确认是广告 -> 记入判定记忆，今后同类 0ms 直删
+            if text:
+                await asyncio.to_thread(db.remember_verdict, it.get("chat"),
+                                        text, "confirmed", "admin_review")
+            note = "已确认广告，同类内容今后直接删除"
+        else:
+            note = "已确认判定正确"
+
+        await query.answer(note[:190])
+        # 前进到下一条；到页尾就自动翻页
+        done = (batch.get("done") or 0) + 1
+        cursor = idx + 1
+        page = cursor // REVIEW_PAGE_SIZE
+        await asyncio.to_thread(db.advance_review_batch, bid, cursor, done)
+        if cursor >= len(batch["items"]):
+            await query.edit_message_text(
+                f"✅ 复核完成：共 {len(batch['items'])} 条，"
+                f"已处理 {done} 条。\n\n"
+                f"误删标记会写入判定记忆，同类内容今后直接放行；\n"
+                f"确认的广告也会记住，今后 0ms 直删。")
+            return
+        batch["cursor"] = cursor
+        text_page, kb = _review_page(batch, page)
+        await query.edit_message_text(text_page, reply_markup=kb)
+
+    elif data.startswith("rvpg_"):
+        parts = data.split("_")
+        if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+            await query.answer()
+            return
+        batch = await asyncio.to_thread(db.get_review_batch, int(parts[1]))
+        if not batch:
+            await query.answer("该复核批次已失效", show_alert=True)
+            return
+        text_page, kb = _review_page(batch, int(parts[2]))
+        await query.edit_message_text(text_page, reply_markup=kb)
+
     elif data.startswith("blk_"):
         try:
             rec_id = int(data.split("_", 1)[1])
@@ -1365,36 +1428,94 @@ async def job_refresh_admins(context: ContextTypes.DEFAULT_TYPE) -> None:
         await _refresh_admins(context.application, cid)
         await _learn_managed_links(context.application, cid)
 
-async def job_sample_review(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """抽样复核：每天推几条删除记录给管理员确认。
+# 每屏显示几条。取 3：一屏能看全，按钮不超出 Telegram 的排版宽度，
+# 且"看 3 条点几下"的行为模式比"看 1 条点 1 下"更接近批量审核。
+REVIEW_PAGE_SIZE = 3
 
-    来自实际使用数据的判断：上线以来 1844 次删除、管理员只复核了 1 次（0.05%）。
-    系统在"盲信"状态下运行——而"边用边更新"需要反馈才能更新。
-    抽样复核每次只看几条，但能让准确率**可测量**，并且每条结论
-    都会沉淀成判定记忆（同类内容今后自动处理）。
+
+def _review_page(batch: dict, page: int):
+    """构造一页复核内容。返回 (文本, 键盘)。"""
+    items = batch["items"]
+    total = len(items)
+    start = page * REVIEW_PAGE_SIZE
+    chunk = items[start:start + REVIEW_PAGE_SIZE]
+
+    lines = [f"🔍 抽样复核  第 {start + 1}-{start + len(chunk)} / {total} 条"]
+    lines.append("判对了不用点；判错了点对应按钮（会立刻生效并记住）")
+    lines.append("")
+    rows = []
+    for i, it in enumerate(chunk):
+        idx = start + i
+        lines.append(f"{idx + 1}. [{it.get('chat_name', '')[:8]}] "
+                     f"{str(it.get('text', ''))[:60]}")
+        lines.append(f"   置信 {it.get('conf', 0):.2f} / {it.get('source', '')}"
+                     f" / #{it.get('rec', 0)}")
+        # 一条消息一行按钮：去掉 / 拉黑 / 看原群
+        rows.append([
+            InlineKeyboardButton("✅ 判对了", callback_data=f"rvok_{batch['id']}_{idx}"),
+            InlineKeyboardButton("↩️ 误删", callback_data=f"rvfp_{batch['id']}_{idx}"),
+            InlineKeyboardButton("🚫 是广告", callback_data=f"rvad_{batch['id']}_{idx}"),
+        ])
+    # 翻页
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ 上一页",
+                                        callback_data=f"rvpg_{batch['id']}_{page - 1}"))
+    if start + len(chunk) < total:
+        nav.append(InlineKeyboardButton("下一页 ➡️",
+                                        callback_data=f"rvpg_{batch['id']}_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    return "\n".join(lines), InlineKeyboardMarkup(rows)
+
+
+async def _send_review_batch(bot, records: list) -> bool:
+    """把一批删除记录做成可翻页的复核入口。
+
+    为什么要批次（管理员实测反馈）："一次 40-50 条，在机器人端几乎无法操作"。
+    逐条发通知会把对话冲垮，只能一条条点，实际结果是没人复核——
+    上线以来 1844 次删除只被复核过 1 次。
     """
-    rows = await asyncio.to_thread(db.sample_deletions, 0, 12, SAMPLE_REVIEW_COUNT)
+    items = []
+    for r in records:
+        row = await asyncio.to_thread(db.get_chat, r["chat_id"])
+        items.append({
+            "rec": r["id"],
+            "chat": r["chat_id"],
+            "chat_name": (row["title"] if row else "") or str(r["chat_id"]),
+            "text": r["text_snapshot"],
+            "conf": r["confidence"] if r["confidence"] is not None else -1,
+            "source": r["source"],
+        })
+    bid = await asyncio.to_thread(db.create_review_batch, items)
+    if not bid:
+        return False
+    batch = await asyncio.to_thread(db.get_review_batch, bid)
+    text, kb = _review_page(batch, 0)
+    try:
+        await bot.send_message(chat_id=ADMIN_ID, text=text, reply_markup=kb)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("复核批次推送失败: %s", exc)
+        return False
+
+
+async def job_sample_review(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """抽样复核：每天推一批删除记录给管理员复核。
+
+    来自实际使用数据：上线以来 1844 次删除、管理员只复核了 1 次（0.05%）。
+    系统在"盲信"状态下运行——而"边用边更新"需要反馈才能更新。
+
+    抽样量从 5 提到 30：5 条的日覆盖率只有 0.14%，若真实误删率 1%，
+    要 20 天才能观察到 1 例，置信区间宽到没有意义。
+    """
+    rows = await asyncio.to_thread(db.sample_deletions, 0, 12,
+                                   SAMPLE_REVIEW_COUNT)
     if not rows:
         return
     await asyncio.to_thread(db.mark_sampled, [r["id"] for r in rows])
+    await _send_review_batch(context.bot, rows)
 
-    total = await asyncio.to_thread(db.count_all_deletions)
-    lines = [
-        f"🔍 抽样复核（随机抽了 {len(rows)} 条 / 近 12 小时共删 {total} 条）",
-        "",
-        "请逐条判断。**判对了就不用操作**，判错了点按钮：",
-    ]
-    for i, r in enumerate(rows, 1):
-        row = await asyncio.to_thread(db.get_chat, r["chat_id"])
-        name = (row["title"] if row else "") or r["chat_id"]
-        conf = r["confidence"] if r["confidence"] is not None else -1
-        lines.append(
-            f"{i}. [{str(name)[:10]}] {str(r['text_snapshot'])[:44]!r}\n"
-            f"   置信度 {conf:.2f} / {r['source']} / 记录 #{r['id']}"
-        )
-    lines += ["", "为什么做这个：实测 1844 次删除只被复核过 1 次，",
-              "反馈回路没闭合的话，判定质量就是不可测的。"]
-    await _send_admin(context.bot, "\n".join(lines))
 
 async def job_self_evolve(context: ContextTypes.DEFAULT_TYPE) -> None:
     """自进化：挖候选规则 + 检查毕业。
