@@ -56,6 +56,8 @@ CREATE TABLE IF NOT EXISTS chats (
     batch_seconds    INTEGER DEFAULT 90,          -- L2 常规攒批窗口
     batch_max        INTEGER DEFAULT 100,         -- L2 单批上限
     daily_token_cap  INTEGER DEFAULT 300000,      -- 每群每日 token 预算
+    report_limit     INTEGER DEFAULT 20,          -- 每人每日举报额度
+    log_channel_id   INTEGER,                     -- 删除记录频道（0/NULL=不发）
     is_active        INTEGER DEFAULT 1,
     created_at       DATETIME DEFAULT CURRENT_TIMESTAMP
 );
@@ -187,12 +189,24 @@ CREATE TABLE IF NOT EXISTS spam_reports (
     full_name     TEXT,
     message_id    INTEGER NOT NULL,
     content       TEXT,
+    source        TEXT DEFAULT 'in_group',    -- in_group | forward
+    confidence    REAL,                       -- AI 判定置信度
     reviewed      INTEGER DEFAULT 0,
     action        TEXT,                       -- delete | dismiss
     reviewed_at   DATETIME,
     created_at    DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 CREATE INDEX IF NOT EXISTS idx_report_chat ON spam_reports (chat_id, reviewed);
+CREATE INDEX IF NOT EXISTS idx_report_reporter ON spam_reports (reporter_id, created_at);
+
+-- 举报额度用量（每人每日）
+CREATE TABLE IF NOT EXISTS report_usage (
+    usage_date TEXT NOT NULL,
+    chat_id    INTEGER NOT NULL,
+    reporter_id INTEGER NOT NULL,
+    used       INTEGER DEFAULT 0,
+    PRIMARY KEY (usage_date, chat_id, reporter_id)
+);
 
 -- 每日榜统计（支持周榜/月榜）
 CREATE TABLE IF NOT EXISTS daily_report_stats (
@@ -219,6 +233,27 @@ CREATE TABLE IF NOT EXISTS token_usage (
 """
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """为已存在的库补齐后加的列。SQLite 的 ADD COLUMN 是幂等的（先查再改）。"""
+    additions = {
+        "chats": [
+            ("report_limit", "INTEGER DEFAULT 20"),
+            ("log_channel_id", "INTEGER"),
+            ("fastlane_seconds", "INTEGER DEFAULT 15"),
+        ],
+        "spam_reports": [
+            ("source", "TEXT DEFAULT 'in_group'"),
+            ("confidence", "REAL"),
+        ],
+    }
+    for table, cols in additions.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, decl in cols:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+                logger.info("迁移：%s 新增列 %s", table, name)
+
+
 def init_db(path: str) -> None:
     """建库。必须在任何连接之前调用一次。"""
     global _db_path
@@ -226,6 +261,7 @@ def init_db(path: str) -> None:
     conn = sqlite3.connect(path, timeout=DB_TIMEOUT)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.commit()
         mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
         if mode.lower() != "wal":
@@ -309,10 +345,20 @@ def set_chat_field(chat_id: int, field: str, value: Any) -> None:
         "title", "chat_nature", "strictness", "confidence_cut", "shadow_mode",
         "notify_admin", "report_board", "report_min_rate", "fastlane_seconds",
         "batch_seconds", "batch_max", "daily_token_cap", "is_active",
+        "report_limit", "log_channel_id",
     }
     if field not in allowed:
         raise ValueError(f"不允许修改字段: {field}")
-    execute(f"UPDATE chats SET {field}=? WHERE chat_id=?", (value, chat_id))
+    with tx() as conn:
+        cur = conn.execute(f"UPDATE chats SET {field}=? WHERE chat_id=?",
+                           (value, chat_id))
+        if cur.rowcount == 0:
+            # 裸 UPDATE 影响 0 行是静默失败：调用方以为改好了，实际没改。
+            # 这在"群 ID 打错"或"群还没注册"时很难排查，所以显式报错。
+            raise ValueError(
+                f"群 {chat_id} 不存在，无法设置 {field}。"
+                f"先用 register_chat / manage.py add 注册"
+            )
 
 
 # --------------------------------------------------------------------------
@@ -565,9 +611,74 @@ def save_report(chat_id: int, reporter_id: int, reporter_name: str, user_id: int
         return None
 
 
+def report_quota_left(chat_id: int, reporter_id: int) -> int:
+    """今日剩余举报额度。额度是防刷的手段，不是省钱手段——
+    单条判定约 0.00006 元，钱不是问题；真正的成本是误报占用管理员注意力。"""
+    limit = 20
+    row = query_one("SELECT report_limit FROM chats WHERE chat_id=?", (chat_id,))
+    if row and row["report_limit"] is not None:
+        limit = row["report_limit"]
+    if limit <= 0:
+        return 10 ** 6  # 0 表示不限
+    today = datetime.now().strftime("%Y-%m-%d")
+    r = query_one("""SELECT used FROM report_usage
+                     WHERE usage_date=? AND chat_id=? AND reporter_id=?""",
+                  (today, chat_id, reporter_id))
+    return max(0, limit - (r["used"] if r else 0))
+
+
+def report_quota_consume(chat_id: int, reporter_id: int) -> None:
+    today = datetime.now().strftime("%Y-%m-%d")
+    execute("""
+        INSERT INTO report_usage (usage_date, chat_id, reporter_id, used)
+        VALUES (?,?,?,1)
+        ON CONFLICT(usage_date, chat_id, reporter_id)
+        DO UPDATE SET used = used + 1
+    """, (today, chat_id, reporter_id))
+
+
+def reporter_accuracy(reporter_id: int, chat_id: int = 0) -> tuple[int, int]:
+    """举报人的历史准确率 (有效数, 总数)。用于识别乱举报的人。"""
+    if chat_id:
+        row = query_one("""
+            SELECT COUNT(*) total,
+                   SUM(CASE WHEN action='delete' THEN 1 ELSE 0 END) valid
+            FROM spam_reports WHERE reporter_id=? AND chat_id=?""",
+            (reporter_id, chat_id))
+    else:
+        row = query_one("""
+            SELECT COUNT(*) total,
+                   SUM(CASE WHEN action='delete' THEN 1 ELSE 0 END) valid
+            FROM spam_reports WHERE reporter_id=?""", (reporter_id,))
+    if not row:
+        return 0, 0
+    return (row["valid"] or 0), (row["total"] or 0)
+
+
+def set_log_channel(chat_id: int, channel_id: int | None) -> bool:
+    """设置记录频道。群不存在时返回 False 而非静默无操作。"""
+    with tx() as conn:
+        cur = conn.execute("UPDATE chats SET log_channel_id=? WHERE chat_id=?",
+                           (channel_id, chat_id))
+        if cur.rowcount == 0:
+            logger.warning("set_log_channel: 群 %s 不存在", chat_id)
+            return False
+    return True
+
+
+def chats_with_log_channel() -> list[sqlite3.Row]:
+    return query("""SELECT * FROM chats
+                    WHERE is_active=1 AND log_channel_id IS NOT NULL
+                      AND log_channel_id != 0""")
+
+
 def mark_report_reviewed(report_id: int, action: str) -> None:
     execute("""UPDATE spam_reports SET reviewed=1, action=?, reviewed_at=?
                WHERE id=?""", (action, _now(), report_id))
+
+
+def get_report(report_id: int):
+    return query_one("SELECT * FROM spam_reports WHERE id=?", (report_id,))
 
 
 def report_overview(chat_id: int) -> dict:

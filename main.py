@@ -150,6 +150,215 @@ async def _send_admin(bot, text: str, **kw) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 举报：群内 @机器人 / /report / 转发到私聊
+# ---------------------------------------------------------------------------
+
+# 判定一条举报内容用的最小请求。单条判定约 3,500 token（多数命中缓存）
+# + 20 输出 token ≈ 0.00006 元，所以钱不是限制，误报占用注意力才是，
+# 因此额度只是防刷，设得比较宽松。
+REPORT_LIMIT_DEFAULT = 20
+
+# 举报人历史准确率低于此值且样本足够时，降级为"仅记录不处理"
+REPORTER_MIN_ACCURACY = 0.20
+REPORTER_MIN_SAMPLES = 8
+
+
+async def _pick_report_chat(update: Update, forwarded_user_id: int) -> tuple[int, str]:
+    """判断这条举报属于哪个群。返回 (chat_id, 来源说明)。
+
+    转发的消息拿不到原始 chat_id（Telegram 只给"谁发的"，不给"哪群的第几条"），
+    所以按"被举报人所在群"匹配。若举报人只在一个已注册群里，直接用那个群。
+    """
+    chats = await asyncio.to_thread(db.list_active_chats)
+    if not chats:
+        return 0, ""
+
+    # 优先：从群内发起的举报（回复 + @机器人 / /report），chat 是明确的
+    chat = update.effective_chat
+    if chat and chat.type in ("group", "supergroup"):
+        return chat.id, "群内"
+
+    # 转发路径：看被举报人在哪些已注册群里出现过
+    if forwarded_user_id:
+        for c in chats:
+            st = await asyncio.to_thread(db.user_stats, c["chat_id"],
+                                         forwarded_user_id)
+            if st["msg_n"] > 0:
+                return c["chat_id"], "转发"
+    # 兜底：举报人只服务一个群时用那个
+    if len(chats) == 1:
+        return chats[0]["chat_id"], "转发"
+    return 0, ""
+
+
+async def _handle_forwarded_report(update: Update,
+                                   context: ContextTypes.DEFAULT_TYPE) -> None:
+    """私聊转发消息给机器人 = 举报。
+
+    能拿到什么取决于转发来源（已实测）：
+      · MessageOriginChannel 带 message_id -> 理论上可删原消息
+      · MessageOriginUser / Chat / HiddenUser **不带 message_id** -> 删不掉原消息
+    所以转发举报的产出是：判定内容 + 累加违规 + 必要时拉黑，
+    而不是补删某一条。这与举报的定位一致——抓漏网广告的账号。
+    """
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg or not user:
+        return
+
+    origin = getattr(msg, "forward_origin", None)
+    if origin is None and not getattr(msg, "forward_from", None):
+        await msg.reply_text(
+            "把要举报的消息**转发**给我即可。\n\n"
+            "注意：转发只能用于识别内容与累加违规，**无法删除原消息**"
+            "（Telegram 不提供原消息位置）。如需直接删除，"
+            "请在群里回复那条消息并 @我。",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    from telegram import (MessageOriginChannel, MessageOriginChat,
+                          MessageOriginHiddenUser, MessageOriginUser)
+
+    target_id = 0
+    target_name = "未知"
+    origin_note = ""
+    if isinstance(origin, MessageOriginUser):
+        target_id = origin.sender_user.id
+        target_name = origin.sender_user.full_name
+        origin_note = "用户转发"
+    elif isinstance(origin, MessageOriginHiddenUser):
+        target_name = origin.sender_user_name or "隐藏用户"
+        origin_note = "隐藏转发（对方设置了隐藏转发来源）"
+    elif isinstance(origin, MessageOriginChannel):
+        target_id = origin.chat.id
+        target_name = origin.chat.title or str(origin.chat.id)
+        origin_note = f"频道转发 msg_id={origin.message_id}"
+    elif isinstance(origin, MessageOriginChat):
+        target_id = origin.sender_chat.id
+        target_name = origin.sender_chat.title or str(origin.sender_chat.id)
+        origin_note = "群组转发"
+
+    content = (msg.text or msg.caption or "[图片/媒体]")[:400]
+
+    chat_id, how = await _pick_report_chat(update, target_id)
+    if not chat_id:
+        await msg.reply_text(
+            "无法判断这条举报属于哪个群。\n"
+            "请把机器人拉进相关群，或在群内直接回复消息并 @我。"
+        )
+        return
+
+    # 额度与准确率
+    if not _is_admin_user(user.id):
+        left = await asyncio.to_thread(db.report_quota_left, chat_id, user.id)
+        if left <= 0:
+            await msg.reply_text(
+                "今日举报次数已用完，明天再来。\n"
+                "（额度是为了防刷，不是省钱——判定本身几乎不花钱）"
+            )
+            return
+        valid, total = await asyncio.to_thread(db.reporter_accuracy, user.id, chat_id)
+        if total >= REPORTER_MIN_SAMPLES and valid / total < REPORTER_MIN_ACCURACY:
+            await msg.reply_text(
+                f"你的历史举报准确率偏低（{valid}/{total}），"
+                "本条已记录但暂不处理。请确认确实是广告再举报。"
+            )
+            await asyncio.to_thread(db.report_quota_consume, chat_id, user.id)
+            return
+
+    report_id = await asyncio.to_thread(
+        db.save_report, chat_id, user.id, user.full_name,
+        target_id, target_name,
+        # 转发路径没有原消息 ID，用 0 占位（不可删除）
+        origin.message_id if isinstance(origin, MessageOriginChannel) else 0,
+        content,
+    )
+    if report_id is None:
+        return
+    await asyncio.to_thread(db.report_quota_consume, chat_id, user.id)
+
+    logger.info("转发举报 chat=%s reporter=%s target=%s(%s) %s",
+                chat_id, user.id, target_name, target_id, origin_note)
+
+    # 送判定：转发没有原消息，无法删除，所以只做内容判定
+    pipeline = _manager.get(chat_id, on_spam=_make_on_spam(context.application),
+                            notify=_make_notify(context.application),
+                            on_log=_make_on_log(context.application))
+    pending = PendingMessage(
+        row_id=-(10 ** 9 + report_id),   # 负 ID 表示举报，且不与群内举报冲突
+        message_id=0, chat_id=chat_id, user_id=target_id,
+        full_name=target_name, text=content, reply_to=None, timestamp="",
+        fast=True, report_id=report_id, origin="forward",
+    )
+    async with pipeline._lock:  # noqa: SLF001
+        pipeline._fast.appendleft(pending)  # noqa: SLF001
+
+    await msg.reply_text(
+        f"✅ 已受理举报：{target_name}\n"
+        f"归属群：{chat_id}（{how}匹配）\n"
+        f"剩余今日额度：{await asyncio.to_thread(db.report_quota_left, chat_id, user.id)}\n\n"
+        f"判定结果会异步给出；若确认是广告，会累加该账号的违规次数。"
+        + ("" if target_id else "\n⚠️ 未能识别被举报人 ID，只能记录内容。")
+    )
+
+
+# ---------------------------------------------------------------------------
+# 记录频道
+# ---------------------------------------------------------------------------
+
+def _make_on_log(app: Application):
+    """把删除记录写到频道。这是 V1 缺失的**可回溯证据链**：
+    V1 的 spam_records 没有正文列，导致事后无法复核任何一条删除。
+
+    注意这是**同步工厂**，返回 async 回调。误加 async 会让调用处拿到一个
+    未被 await 的协程，功能静默失效（只有 RuntimeWarning 提示）。
+    _make_on_spam / _make_notify 同样是同步工厂，保持一致。
+    """
+    async def on_log(verdicts: list[Verdict], shadow: bool) -> None:
+        if not verdicts:
+            return
+        by_chat: dict[int, list[Verdict]] = {}
+        for v in verdicts:
+            by_chat.setdefault(v.message.chat_id, []).append(v)
+
+        for chat_id, items in by_chat.items():
+            row = await asyncio.to_thread(db.get_chat, chat_id)
+            if not row or not row["log_channel_id"]:
+                continue
+            title = row["title"] or str(chat_id)
+            head = ("👻 影子（未删）" if shadow else "🗑️ 已删除")
+            lines = [f"{head} {len(items)} 条 · {html.escape(str(title))}"]
+            for v in items[:15]:
+                m = v.message
+                lines.append(
+                    f"\n#{m.message_id} [{v.confidence:.2f}] "
+                    f"{html.escape(str(m.full_name)[:20])}"
+                    + (f" {m.marker}" if m.marker else "")
+                    + f"\n{html.escape((m.text or '')[:200])}"
+                )
+            if len(items) > 15:
+                lines.append(f"\n…另有 {len(items) - 15} 条")
+            kb = None
+            if items:
+                kb = InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩️ 误删恢复",
+                                         callback_data=f"revive_{chat_id}_{items[0].message.user_id}"),
+                    InlineKeyboardButton("🚫 拉黑",
+                                         callback_data=f"bl_{chat_id}_{items[0].message.user_id}"),
+                ]])
+            try:
+                await app.bot.send_message(
+                    chat_id=row["log_channel_id"], text="\n".join(lines),
+                    reply_markup=kb, disable_web_page_preview=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("写记录频道失败 channel=%s: %s",
+                               row["log_channel_id"], exc)
+    return on_log
+
+
+
+# ---------------------------------------------------------------------------
 # 删除执行
 # ---------------------------------------------------------------------------
 
@@ -281,10 +490,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat = update.effective_chat
     user = update.effective_user
 
-    # 只处理群组
-    if chat.type not in ("group", "supergroup"):
-        return
     if user.is_bot:
+        return
+
+    # 私聊：转发消息 = 举报
+    if chat.type == "private":
+        await _handle_forwarded_report(update, context)
+        return
+
+    # 群组以外不处理（频道等）
+    if chat.type not in ("group", "supergroup"):
         return
 
     row = await asyncio.to_thread(db.get_chat, chat.id)
@@ -328,7 +543,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     )
 
     pipeline = _manager.get(chat.id, on_spam=_make_on_spam(context.application),
-                            notify=_make_notify(context.application))
+                            notify=_make_notify(context.application),
+                            on_log=_make_on_log(context.application))
     verdict = await pipeline.submit(pending)
 
     # L0 命中：立即删除，不等 LLM
@@ -369,8 +585,9 @@ async def _handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE,
         reply_to=None, timestamp="",
     )
     pipeline = _manager.get(chat_id, on_spam=_make_on_spam(context.application),
-                            notify=_make_notify(context.application))
-    # 举报直接进快车道：群友主动举报的应当尽快处理
+                            notify=_make_notify(context.application),
+                            on_log=_make_on_log(context.application))
+    pending.report_id = report_id
     pending.fast = True
     async with pipeline._lock:  # noqa: SLF001 - 有意插队
         pipeline._fast.appendleft(pending)  # noqa: SLF001
@@ -567,6 +784,63 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                         update.effective_user, "report")
 
 
+async def cmd_logchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """设置/取消删除记录频道。
+
+    用法：
+      /logchannel off                    取消
+      /logchannel -1001234567890         设为该频道（机器人需是频道管理员）
+    在频道里发 /logchannel 也可，会取当前频道 ID。
+    """
+    if not _is_admin_user(update.effective_user.id if update.effective_user else None):
+        return
+    msg = update.effective_message
+    chat = update.effective_chat
+    if not msg or not chat:
+        return
+    args = context.args or []
+
+    if args and args[0] == "off":
+        for c in await asyncio.to_thread(db.list_active_chats):
+            await asyncio.to_thread(db.set_log_channel, c["chat_id"], None)
+        await msg.reply_text("✅ 已取消所有群的记录频道。")
+        return
+
+    if args and args[0].lstrip("-").isdigit():
+        cid = int(args[0])
+    elif chat.type == "channel":
+        cid = chat.id
+    else:
+        rows = await asyncio.to_thread(db.chats_with_log_channel)
+        cur = rows[0]["log_channel_id"] if rows else "未设置"
+        await msg.reply_text(
+            f"当前记录频道：{cur}\n\n"
+            "用法：\n"
+            "/logchannel -1001234567890   设为该频道\n"
+            "/logchannel off              取消\n"
+            "或在频道内直接发 /logchannel\n\n"
+            "频道会收到每条删除记录：消息ID、置信度、用户、信任标记、正文。\n"
+            "这是 V1 缺失的证据链——V1 的记录表没有正文，事后无法复核。\n\n"
+            "注意：把机器人设为该频道的管理员才能发帖。"
+        )
+        return
+
+    # 先验证能不能发
+    try:
+        probe = await context.bot.send_message(chat_id=cid, text="记录频道连通性测试")
+        await probe.delete()
+    except Exception as exc:  # noqa: BLE001
+        await msg.reply_text(f"❌ 无法向 {cid} 发消息：{exc}\n"
+                            "请先把机器人设为该频道管理员。")
+        return
+
+    # 单群场景直接绑；多群时绑到举报来源匹配的那个（默认全部）
+    chats = await asyncio.to_thread(db.list_active_chats)
+    for c in chats:
+        await asyncio.to_thread(db.set_log_channel, c["chat_id"], cid)
+    await msg.reply_text(f"✅ 已把 {len(chats)} 个群的删除记录指向频道 {cid}")
+
+
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin_user(update.effective_user.id if update.effective_user else None):
         return
@@ -757,6 +1031,7 @@ async def post_init(app: Application) -> None:
         ids,
         on_spam=_make_on_spam(app),
         notify=_make_notify(app),
+        on_log=_make_on_log(app),
     )
     for cid in ids:
         await _refresh_admins(app, cid)
@@ -892,6 +1167,16 @@ def main() -> None:
         os.makedirs(db_dir, exist_ok=True)
         logger.info("已创建数据库目录: %s", db_dir)
 
+    # 廉价自检：这三个必须是同步工厂（返回协程函数）。
+    # 误加 async 会让它们返回未 await 的协程，功能静默失效。
+    import inspect as _inspect
+    for _fn in (_make_on_spam, _make_notify, _make_on_log):
+        if _inspect.iscoroutinefunction(_fn):
+            raise RuntimeError(
+                f"{_fn.__name__} 被误声明为 async。它应当是同步工厂，"
+                f"返回 async 回调；否则调用处会拿到未 await 的协程，功能静默失效。"
+            )
+
     db.init_db(DB_PATH)
 
     app = (ApplicationBuilder()
@@ -910,6 +1195,7 @@ def main() -> None:
     app.add_handler(CommandHandler("bl", cmd_bl))
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("logchannel", cmd_logchannel))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))

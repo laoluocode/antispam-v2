@@ -76,6 +76,8 @@ class PendingMessage:
     history: list[str] = field(default_factory=list)
     fast: bool = False
     whitelist: str = ""      # "" | "advertiser"（trusted 的消息不会入队）
+    report_id: int = 0       # >0 表示这条来自举报，判定后需回填举报状态
+    origin: str = "group"    # group | forward（转发举报无法删除原消息）
 
     @property
     def marker(self) -> str:
@@ -97,11 +99,14 @@ class ChatPipeline:
     """单个群的检测流水线。每个群一个实例，互不干扰。"""
 
     def __init__(self, chat_id: int, client: DeepSeekClient,
-                 on_spam, notify=None) -> None:
+                 on_spam, notify=None, on_log=None) -> None:
         self.chat_id = chat_id
         self.client = client
         self.on_spam = on_spam          # async (Verdict) -> None，由 main 注入执行删除
         self.notify = notify            # async (list[Verdict]) -> None，通知管理员
+        self.on_log = on_log            # async (list[Verdict], shadow) -> None，写记录频道
+        # 判定完成后需要回填的举报：row_id -> report_id
+        self._pending_reports: dict[int, int] = {}
         self._fast: deque[PendingMessage] = deque()
         self._slow: deque[PendingMessage] = deque()
         self._lock = asyncio.Lock()
@@ -316,6 +321,24 @@ class ChatPipeline:
             is_spam = conf >= threshold
             verdicts.append(Verdict(m, is_spam, conf, "llm"))
 
+        # 回填举报状态：举报要闭环，否则举报人看不到结果、也没法统计准确率
+        for m in batch:
+            rid = m.report_id or self._pending_reports.pop(m.row_id, 0)
+            if not rid:
+                continue
+            conf = scores.get(m.row_id)
+            if conf is None:
+                continue
+            threshold = (max(cut, ADVERTISER_CUT)
+                         if m.whitelist == "advertiser" else cut)
+            await asyncio.to_thread(
+                db.mark_report_reviewed, rid,
+                "delete" if conf >= threshold else "dismiss",
+            )
+            if conf >= threshold:
+                await asyncio.to_thread(
+                    db.add_fewshot, self.chat_id, "positive", m.text, "report")
+
         spam = [v for v in verdicts if v.is_spam]
         if not spam:
             return
@@ -327,6 +350,9 @@ class ChatPipeline:
                 v.message.full_name, v.message.message_id, v.message.text,
                 v.confidence, "llm", action,
             )
+
+        if self.on_log:
+            await self.on_log(spam, shadow)
 
         if shadow:
             logger.info("chat=%s 影子模式：本应删除 %d 条（未执行）",
@@ -407,16 +433,17 @@ class PipelineManager:
         self._tasks: dict[int, asyncio.Task] = {}
         self._stop = asyncio.Event()
 
-    def get(self, chat_id: int, on_spam, notify=None) -> ChatPipeline:
+    def get(self, chat_id: int, on_spam, notify=None, on_log=None) -> ChatPipeline:
         p = self._pipelines.get(chat_id)
         if p is None:
-            p = ChatPipeline(chat_id, self.client, on_spam, notify)
+            p = ChatPipeline(chat_id, self.client, on_spam, notify, on_log)
             self._pipelines[chat_id] = p
         return p
 
-    async def start(self, chat_ids: list[int], on_spam, notify=None) -> None:
+    async def start(self, chat_ids: list[int], on_spam, notify=None,
+                    on_log=None) -> None:
         for cid in chat_ids:
-            p = self.get(cid, on_spam, notify)
+            p = self.get(cid, on_spam, notify, on_log)
             self._tasks[cid] = asyncio.create_task(p.run(self._stop))
         logger.info("已启动 %d 个群的检测流水线", len(self._tasks))
 
