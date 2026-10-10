@@ -53,7 +53,12 @@ logging.basicConfig(
 )
 # httpx 的 INFO 日志会把 Telegram API URL（含明文 token）写进日志。
 # V1 就有这个问题，对外服务前必须压掉。
-logging.getLogger("httpx").setLevel(logging.WARNING)
+#
+# 注意：httpx 被 openai 作为依赖装进来时，实际 logger 名可能是 `httpx2`
+# （openai 的 vendored 版本）。按名字逐个压不可靠，这里扫描已存在的 logger。
+for _name in list(logging.root.manager.loggerDict):
+    if _name.split(".")[0].startswith("httpx"):
+        logging.getLogger(_name).setLevel(logging.WARNING)
 logging.getLogger("telegram.ext.Application").setLevel(logging.WARNING)
 logger = logging.getLogger("antispam")
 
@@ -682,7 +687,103 @@ async def post_shutdown(app: Application) -> None:
     logger.info("已下线")
 
 
+async def preflight() -> int:
+    """启动前自检：验证 token、模型、数据库、权限，不进入轮询。
+
+    用途：部署前确认配置正确。尤其要确认机器人在目标群里有删除权限——
+    Telegram 的硬限制是普通成员只能删自己的消息，没有管理员权限就等于不工作。
+    """
+    ok = True
+    print("=" * 60)
+    print("  反广告机器人 启动自检")
+    print("=" * 60)
+
+    # 1. 数据库
+    try:
+        db.init_db(DB_PATH)
+        import sqlite3
+        conn = sqlite3.connect(DB_PATH)
+        mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+        conn.close()
+        print(f"  [1] 数据库      OK  {DB_PATH}  journal={mode}")
+        if mode.lower() != "wal":
+            print("      ⚠️ 非 WAL 模式，并发写入会阻塞")
+            ok = False
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [1] 数据库      FAIL  {exc}")
+        return 1
+
+    # 2. Telegram
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    try:
+        async with app:
+            me = await app.bot.get_me()
+            print(f"  [2] Telegram    OK  @{me.username} ({me.first_name})")
+            if not me.can_read_all_group_messages:
+                print("      ⚠️ 隐私模式仍开启（can_read_all_group_messages=False），"
+                      "机器人只能收到 @提及 与回复，会漏掉绝大多数广告！")
+                print("         修复：@BotFather -> /setprivacy -> 选本机器人 -> Disable")
+                ok = False
+            else:
+                print("      隐私模式已关闭，可收到群内全部消息")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [2] Telegram    FAIL  {exc}")
+        return 1
+
+    # 3. 已注册的群与权限
+    chats = db.list_active_chats()
+    print(f"  [3] 注册群      {len(chats)} 个")
+    for c in chats:
+        cid = c["chat_id"]
+        try:
+            member = await app.bot.get_chat_member(cid, app.bot.id)
+            can_delete = getattr(member, "can_delete_messages", False)
+            status = member.status
+            mark = "OK  " if can_delete else "WARN"
+            print(f"      [{mark}] {c['title'] or cid}  status={status}  "
+                  f"可删消息={can_delete}  "
+                  f"模式={'影子' if c['shadow_mode'] else '删除'}  "
+                  f"阈值={c['confidence_cut']}")
+            if not can_delete:
+                print("            ⚠️ 缺少删除权限，判定结果无法执行！"
+                      "  请把机器人设为群管理员")
+                ok = False
+        except Exception as exc:  # noqa: BLE001
+            print(f"      [FAIL] {cid}: {exc}（机器人可能不在该群）")
+            ok = False
+
+    # 4. DeepSeek
+    try:
+        client = DeepSeekClient(api_key=DEEPSEEK_API_KEY,
+                                base_url=DEEPSEEK_BASE_URL, model=MODEL_NAME)
+        messages = [
+            {"role": "system", "content": "只输出 JSON：{\"verdicts\":[]}"},
+            {"role": "user", "content": "[ID=1] 昵称=x | 内容=测试"},
+        ]
+        parsed, usage = await client.judge(messages, user_id="preflight")
+        await client.close()
+        print(f"  [4] DeepSeek    OK  {MODEL_NAME}  "
+              f"cache_hit={usage.cache_hit_tokens} "
+              f"miss={usage.cache_miss_tokens} "
+              f"out={usage.completion_tokens} "
+              f"reasoning={usage.reasoning_tokens}")
+        if usage.reasoning_tokens:
+            print("      ⚠️ 出现推理 token，thinking 关闭参数未生效，会白烧输出成本")
+            ok = False
+    except Exception as exc:  # noqa: BLE001
+        print(f"  [4] DeepSeek    FAIL  {exc}")
+        ok = False
+
+    print("=" * 60)
+    print("  自检结果：" + ("全部通过，可以启动" if ok else "存在问题，见上方 ⚠️"))
+    print("=" * 60)
+    return 0 if ok else 1
+
+
 def main() -> None:
+    if "--check" in sys.argv:
+        sys.exit(asyncio.run(preflight()))
+
     if not ADMIN_ID:
         logger.warning("未设置 ADMIN_ID，将无法接收通知")
 
