@@ -171,6 +171,7 @@ class ChatPipeline:
         # 管理员免检
         if await self._is_admin(msg.user_id):
             logger.debug("跳过管理员 chat=%s user=%s", self.chat_id, msg.user_id)
+            await asyncio.to_thread(db.mark_checked, [msg.row_id])
             return None
 
         stats, trust = await self._profile(msg.user_id, msg.full_name)
@@ -180,6 +181,7 @@ class ChatPipeline:
         level = await asyncio.to_thread(db.whitelist_level, self.chat_id, msg.user_id)
         if level == "trusted":
             logger.info("白名单(trusted)跳过 chat=%s user=%s", self.chat_id, msg.user_id)
+            await asyncio.to_thread(db.mark_checked, [msg.row_id])
             return None
         msg.whitelist = level or ""
 
@@ -193,6 +195,7 @@ class ChatPipeline:
                 v = check_repeat(msg.text, history, REPEAT_THRESHOLD)
 
         if v.hit:
+            await asyncio.to_thread(db.mark_checked, [msg.row_id])
             return Verdict(msg, True, 1.0, "local_rule", v.reason)
 
         # --- 分流 ---
@@ -282,10 +285,15 @@ class ChatPipeline:
             )
         except DeepSeekError as exc:
             self.last_error = str(exc)
-            logger.error("chat=%s 判定失败，本批 %d 条留待重试: %s",
-                         self.chat_id, len(batch), exc)
-            # 回队重试：清掉 is_checked 让它们下轮重新取
-            await asyncio.to_thread(self._requeue, batch)
+            keep = await asyncio.to_thread(
+                db.bump_retry, [m.row_id for m in batch])
+            logger.error("chat=%s 判定失败（本批 %d 条，%d 条将重试）: %s",
+                         self.chat_id, len(batch), len(keep), exc)
+            # 只对未超过重试上限的消息回队；超过的已在 bump_retry 里标记完成，
+            # 否则 API 持续异常会让同一批消息每轮重复烧 token。
+            if keep:
+                await asyncio.to_thread(
+                    self._requeue, [m for m in batch if m.row_id in set(keep)])
             return
 
         cost = estimate_cost_yuan(usage, peak=True)
@@ -302,10 +310,19 @@ class ChatPipeline:
         scores = {int(v["id"]): float(v.get("confidence", 0.0))
                   for v in parsed.get("verdicts", [])
                   if "id" in v}
+        # 判定成功的部分立即标记已检测。
+        # 漏掉这一步会让消息永远停在未检测状态，每轮被重新取出来判定。
+        judged = [m.row_id for m in batch if m.row_id in scores]
+        await asyncio.to_thread(db.mark_checked, judged)
+
         missing = [m for m in batch if m.row_id not in scores]
         if missing:
-            logger.warning("chat=%s 有 %d 条缺判定，回队重试", self.chat_id, len(missing))
-            await asyncio.to_thread(self._requeue, missing)
+            keep = await asyncio.to_thread(db.bump_retry, [m.row_id for m in missing])
+            logger.warning("chat=%s 有 %d 条缺判定（%d 条将重试）",
+                           self.chat_id, len(missing), len(keep))
+            if keep:
+                await asyncio.to_thread(
+                    self._requeue, [m for m in missing if m.row_id in set(keep)])
 
         cut = float(cfg.get("confidence_cut", 0.5))
         shadow = bool(cfg.get("shadow_mode", 1))
@@ -372,7 +389,13 @@ class ChatPipeline:
                         v.message.full_name,
                     )
             except Exception as exc:  # noqa: BLE001
-                logger.warning("删除失败 msg=%s: %s", v.message.message_id, exc)
+                if db.is_non_retryable_delete_error(exc):
+                    # 消息已被自己/管理员删掉，或本就不可删。
+                    # 这不是故障，压成 info 以免污染日志（线上曾有 84 次这类 WARNING）。
+                    logger.info("删除跳过（不可重试）msg=%s: %s",
+                                v.message.message_id, exc)
+                else:
+                    logger.warning("删除失败 msg=%s: %s", v.message.message_id, exc)
 
         if self.notify:
             await self.notify(spam)

@@ -54,7 +54,8 @@ CREATE TABLE IF NOT EXISTS chats (
     report_min_rate  REAL    DEFAULT 0.50,        -- 上榜门槛
     fastlane_seconds INTEGER DEFAULT 15,          -- L1 快车道攒批窗口
     batch_seconds    INTEGER DEFAULT 90,          -- L2 常规攒批窗口
-    batch_max        INTEGER DEFAULT 100,         -- L2 单批上限
+    batch_max        INTEGER DEFAULT 50,          -- L2 单批上限（也是攒够即发的阈值）
+                                                  -- 设太大在稀疏群会导致攒不满就等满窗口
     daily_token_cap  INTEGER DEFAULT 300000,      -- 每群每日 token 预算
     report_limit     INTEGER DEFAULT 20,          -- 每人每日举报额度
     log_channel_id   INTEGER,                     -- 删除记录频道（0/NULL=不发）
@@ -97,6 +98,7 @@ CREATE TABLE IF NOT EXISTS messages (
     reply_to    INTEGER,
     timestamp   DATETIME,
     is_checked  INTEGER DEFAULT 0,
+    retry_count INTEGER DEFAULT 0,          -- 判定失败重试次数，超过上限则放弃
     UNIQUE (chat_id, message_id)
 );
 CREATE INDEX IF NOT EXISTS idx_msg_unchecked ON messages (is_checked, chat_id);
@@ -244,6 +246,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "spam_reports": [
             ("source", "TEXT DEFAULT 'in_group'"),
             ("confidence", "REAL"),
+        ],
+        "messages": [
+            ("retry_count", "INTEGER DEFAULT 0"),
         ],
     }
     for table, cols in additions.items():
@@ -478,6 +483,49 @@ def take_unchecked_batch(chat_id: int, limit: int) -> list[sqlite3.Row]:
         return rows
 
 
+# 判定失败的重试上限。超过则放弃并标记已检测，避免失败消息无限重试、
+# 每轮都重新烧一遍 token。放弃的消息仍可在 spam_records / 日志里排查。
+MAX_JUDGE_RETRIES = 3
+
+
+def mark_checked(row_ids: list[int]) -> None:
+    """把消息标记为已检测。
+
+    ⚠️ 这一步在流水线里必须有调用点。漏掉会导致消息永远停在未检测状态，
+    而取批逻辑每轮都会把它们重新送判定 —— 静默重复烧 token。
+    （2026-10-10 线上就踩了这个坑：151 条消息全部 is_checked=0。）
+    """
+    if not row_ids:
+        return
+    with tx() as conn:
+        conn.executemany("UPDATE messages SET is_checked=1 WHERE id=?",
+                         [(i,) for i in row_ids])
+
+
+def bump_retry(row_ids: list[int]) -> list[int]:
+    """重试计数 +1，返回仍未超过上限、需要重试的 row_id。
+
+    失败消息不能无限重试：API 若持续异常，每轮重试都是重复的 token 开销。
+    """
+    if not row_ids:
+        return []
+    with tx() as conn:
+        conn.executemany(
+            "UPDATE messages SET retry_count = retry_count + 1 WHERE id=?",
+            [(i,) for i in row_ids])
+        placeholders = ",".join("?" * len(row_ids))
+        rows = conn.execute(
+            f"""SELECT id FROM messages
+                WHERE id IN ({placeholders}) AND retry_count < ?""",
+            (*row_ids, MAX_JUDGE_RETRIES)).fetchall()
+        keep = [r["id"] for r in rows]
+        give_up = [i for i in row_ids if i not in set(keep)]
+        if give_up:
+            conn.executemany("UPDATE messages SET is_checked=1 WHERE id=?",
+                             [(i,) for i in give_up])
+    return keep
+
+
 def recent_user_texts(chat_id: int, user_id: int, limit: int = 6) -> list[str]:
     """该用户近期发言，用作判定上下文。新到旧。"""
     rows = query("""SELECT text FROM messages WHERE chat_id=? AND user_id=?
@@ -496,6 +544,23 @@ def purge_old_messages(days: int) -> int:
 # --------------------------------------------------------------------------
 # 判定记录
 # --------------------------------------------------------------------------
+
+# Telegram 的删除错误里，这几类是"重试也不会成功"的。
+# V1 有这个判断（_is_non_retryable_delete_error），但线上仍有 84 次
+# "Message to delete not found" 被当成普通失败，反复重试。
+_NON_RETRYABLE_DELETE = (
+    "message to delete not found",
+    "message can't be deleted",
+    "message identifier is not specified",
+    "message is not modified",
+)
+
+
+def is_non_retryable_delete_error(err: Exception) -> bool:
+    """判断删除失败是否不值得重试（消息已被自己/管理员删掉等）。"""
+    text = str(err).lower()
+    return any(p in text for p in _NON_RETRYABLE_DELETE)
+
 
 def save_spam_record(chat_id: int, user_id: int, full_name: str,
                      message_id: int | None, text: str, confidence: float,

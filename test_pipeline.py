@@ -178,6 +178,70 @@ async def main():
     u2 = db.user_stats(cid, 78)
     print("  普通用户 del_count=%d (应为 1，已累计)" % u2["del_n"])
 
+    print("=== 11. 回归：is_checked 必须被标记（线上曾全为 0）===")
+    from deepseek import DeepSeekError as _DSE
+    cid2 = -200
+    db.register_chat(cid2, "标记测试群", "general", shadow_mode=False)
+    db.set_chat_field(cid2, "shadow_mode", 0)
+
+    async def noop(v): pass
+
+    def add_msg(mid, text):
+        return db.save_message(cid2, mid, 1, "群友", text, None,
+                               "2026-10-10 13:00:00")
+
+    # (a) 判定成功 -> 应标记
+    for i in range(3):
+        add_msg(6000 + i, "普通聊天内容 %d" % i)
+    rows = db.query("SELECT id FROM messages WHERE chat_id=? AND is_checked=0", (cid2,))
+    ids = [r["id"] for r in rows]
+    batch = [PendingMessage(i, 6000 + n, cid2, 1, "群友", "普通聊天内容 %d" % n,
+                            None, "t") for n, i in enumerate(ids)]
+    await ChatPipeline(cid2, GradedClient({i: 0.05 for i in ids}), noop, None)._judge(batch)
+    left = db.query("SELECT COUNT(*) n FROM messages WHERE chat_id=? AND is_checked=0", (cid2,))[0]["n"]
+    print("  (a) 判定成功后未检测数=%d (应为 0)" % left)
+    assert left == 0, "判定成功后未标记 is_checked"
+
+    # (b) 断言全部失败 -> 应保留重试，但不超过上限
+    db.execute("DELETE FROM messages WHERE chat_id=?", (cid2,))
+    for i in range(2):
+        add_msg(6100 + i, "测试")
+    rows = db.query("SELECT id, message_id FROM messages WHERE chat_id=? AND is_checked=0", (cid2,))
+    batch = [PendingMessage(r["id"], r["message_id"], cid2, 1, "群友", "测试", None, "t")
+             for r in rows]
+
+    class Boom:
+        async def judge(self, *a, **k):
+            raise _DSE("模拟持续失败")
+    pf = ChatPipeline(cid2, Boom(), noop, None)
+    for attempt in range(db.MAX_JUDGE_RETRIES + 1):
+        await pf._judge(batch)
+    left = db.query("SELECT COUNT(*) n FROM messages WHERE chat_id=? AND is_checked=0", (cid2,))[0]["n"]
+    print("  (b) 连续失败 %d 次后未检测数=%d (应为 0，超过上限即放弃)"
+          % (db.MAX_JUDGE_RETRIES + 1, left))
+    assert left == 0, "超过重试上限后应标记已检测，否则每轮重复烧 token"
+
+    # (c) L0 命中 -> 应标记
+    db.execute("DELETE FROM messages WHERE chat_id=?", (cid2,))
+    rid = add_msg(6200, "我的电话13812345678")
+    p3 = ChatPipeline(cid2, fake, noop, None)
+    m = PendingMessage(rid, 6200, cid2, 1, "群友", "我的电话13812345678", None, "t")
+    v = await p3.submit(m)
+    left = db.query("SELECT COUNT(*) n FROM messages WHERE chat_id=? AND is_checked=0", (cid2,))[0]["n"]
+    print("  (c) L0 命中(hit=%s) 后未检测数=%d (应为 0)" % (bool(v and v.is_spam), left))
+    assert left == 0, "L0 命中后未标记 is_checked"
+
+    # (d) 管理员 / 白名单 -> 也应标记（否则它们永远留在未检测里被反复取出）
+    db.execute("DELETE FROM messages WHERE chat_id=?", (cid2,))
+    db.cache_admins(cid2, [(888, "管理员")])
+    rid = add_msg(6300, "管理员发言")
+    ChatPipeline(cid2, fake, noop, None)  # 新建以刷新管理员缓存
+    p4 = ChatPipeline(cid2, fake, noop, None)
+    await p4.submit(PendingMessage(rid, 6300, cid2, 888, "管理员", "管理员发言", None, "t"))
+    left = db.query("SELECT COUNT(*) n FROM messages WHERE chat_id=? AND is_checked=0", (cid2,))[0]["n"]
+    print("  (d) 管理员免检后未检测数=%d (应为 0)" % left)
+    assert left == 0, "管理员消息未标记 is_checked"
+
     os.unlink(tmp)
     print("\n全部通过")
 
