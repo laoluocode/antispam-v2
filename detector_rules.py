@@ -454,6 +454,73 @@ _DOMAIN_LIKE = re.compile(r"^[a-z0-9.\-]+\.[a-z]{2,}$", re.I)
 
 
 # ---------------------------------------------------------------------------
+# 波次检测（借鉴 Reddit 的"协调行为"识别）
+# ---------------------------------------------------------------------------
+
+# 实测依据（线上 1811 条删除记录）：
+#   删除量中位数 = 2 条/分钟
+#   但有 9 个"波次"，其中最大的一次是 **195 条/分钟、来自 105 个不同账号**
+#   9 个波次覆盖了全部删除量的 25%
+# 单账号维度的规则对"105 个账号同时发广告"这种协作攻击完全无感——
+# 每个账号都只发了一两条，都不触发刷屏阈值。
+#
+# 所以需要**群级**的密度指标：短期内删除率飙升 = 正在被批量投放，
+# 此时降低判定门槛、全部走快车道，把响应时间压到最低。
+RAID_WINDOW_SECONDS = 60          # 观察窗
+RAID_MIN_DELETES = 10             # 窗口内删除数达到这个量级才可能是波次
+RAID_BASELINE_MULTIPLIER = 4.0    # 或达到基线均值的 4 倍（取两者较大值）
+RAID_BASELINE_DEFAULT = 2.0       # 冷启动时的基线假设（实测中位数 2 条/分钟）
+
+
+class RaidDetector:
+    """群级删除密度监控，识别协调投放的波次。
+
+    与逐条判定的区别：逐条看的是"这条是不是广告"，
+    波次检测看的是"这个群现在是不是正在被批量投放"。
+    后者是全局信号，前者看不到。
+    """
+
+    def __init__(self, window: int = RAID_WINDOW_SECONDS,
+                 baseline: float = RAID_BASELINE_DEFAULT):
+        self.window = window
+        self.baseline = baseline
+        self._events: list[float] = []      # 删除时间戳
+        self._active_until = 0.0
+        self._peak = 0
+
+    def record_delete(self, now: float | None = None) -> None:
+        self._events.append(now if now is not None else time.time())
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - self.window
+        while self._events and self._events[0] < cutoff:
+            self._events.pop(0)
+
+    def in_raid(self, now: float | None = None) -> bool:
+        """当前是否处于波次中（含判定后的冷却期）。"""
+        n = now if now is not None else time.time()
+        return n < self._active_until
+
+    def check(self, now: float | None = None) -> tuple[bool, int, float]:
+        """返回 (是否波次, 窗口内删除数, 触发阈值)。
+
+        同时维护冷却期：一旦判定为波次，在窗口长度内保持"波次中"状态——
+        波次是持续过程，不能因为某一秒没删除就立刻退出警戒。
+        """
+        n = now if now is not None else time.time()
+        self._prune(n)
+        count = len(self._events)
+        self._peak = max(self._peak, count)
+
+        threshold = max(RAID_MIN_DELETES,
+                        self.baseline * RAID_BASELINE_MULTIPLIER)
+        if count >= threshold:
+            self._active_until = n + self.window
+            return True, count, threshold
+        return self.in_raid(n), count, threshold
+
+
+# ---------------------------------------------------------------------------
 # 账号资料检测（借鉴 Discord AutoMod 的 MemberProfile 触发类型）
 # ---------------------------------------------------------------------------
 

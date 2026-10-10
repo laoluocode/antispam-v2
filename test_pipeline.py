@@ -899,6 +899,75 @@ async def main():
         assert not check_account_profile(empty).hit
     print("  空昵称安全处理 ✓")
 
+    print("=== 25. 回归：波次检测（协调投放识别）===")
+    # 来源：Reddit 的做法——"用 LLM 捕捉旧系统漏掉的、高度隐蔽的**协调模式**"。
+    # 我们自己的数据里这个模式非常明显（1811 条删除记录）：
+    #   删除量中位数 = 2 条/分钟
+    #   但有 9 个波次，最大一次是 **195 条/分钟、来自 105 个不同账号**
+    #   9 个波次覆盖全部删除量的 25%
+    # 单账号维度的刷屏阈值对"105 个账号同时投放"完全无感——
+    # 每个账号都只发了一两条。所以需要**群级**密度指标。
+    from detector_rules import (
+        RaidDetector, RAID_MIN_DELETES, RAID_BASELINE_MULTIPLIER,
+    )
+
+    print("  阈值 = max(%d, 基线×%.1f)"
+          % (RAID_MIN_DELETES, RAID_BASELINE_MULTIPLIER))
+
+    # (a) 正常时段不误报（实测中位数 2 条/分钟）
+    d = RaidDetector()
+    t0 = 1000.0
+    for i in range(3):
+        d.record_delete(t0 + i * 20)
+    hit, cnt, thr = d.check(t0 + 60)
+    print("  (a) 正常时段 3 条/分钟 -> 波次=%s（应 False，否则正常流量会误报）"
+          % hit)
+    assert not hit, "正常流量不该被判为波次"
+
+    # (b) 真实波次形态：195 条/分钟、105 个账号
+    d2 = RaidDetector()
+    t1 = 2000.0
+    for i in range(195):
+        d2.record_delete(t1 + i * 0.3)
+    hit2, cnt2, _ = d2.check(t1 + 60)
+    print("  (b) 195 条/分钟（实测最大波次）-> 波次=%s 窗口内=%d"
+          % (hit2, cnt2))
+    assert hit2, "真实波次必须识别出来"
+
+    # (c) 冷却期：波次后短暂无删除不应立刻退出警戒
+    hit3, _, _ = d2.check(t1 + 100)
+    print("  (c) 波次后 40 秒（无新删除）-> 波次=%s（应在冷却期内保持）" % hit3)
+    assert hit3, "波次是持续过程，不应因某一秒没删除就退出"
+
+    # (d) 冷却期结束后退出，避免永久处于警戒
+    hit4, _, _ = d2.check(t1 + 200)
+    print("  (d) 波次后 200 秒 -> 波次=%s（应已退出，否则阈值永久偏低）" % hit4)
+    assert not hit4, "冷却期后应退出警戒"
+
+    # (e) 集成：pipeline 里波次状态下阈值收紧且走快车道
+    cidR = -990
+    db.register_chat(cidR, "波次测试群", "general", shadow_mode=False)
+    db.set_chat_field(cidR, "shadow_mode", 0)
+    # 用文件顶部定义的通用 noop（noop20 是测试 20 里的局部函数，这里不可见）
+    pR = ChatPipeline(cidR, Graded({}), noop, None)
+    print("  (e) 初始波次状态=%s 阈值=%s"
+          % (pR._raid.in_raid(), db.get_chat(cidR)["confidence_cut"]))
+    assert not pR._raid.in_raid()
+    for i in range(RAID_MIN_DELETES + 5):
+        pR._raid.record_delete()
+    pR._raid.check()
+    print("      记录 %d 次删除后 -> 波次状态=%s"
+          % (RAID_MIN_DELETES + 5, pR._raid.in_raid()))
+    assert pR._raid.in_raid(), "达到阈值后应进入波次状态"
+
+    # 波次状态下：普通消息也走快车道
+    rid = db.save_message(cidR, 9500, 31, "某群友", "随便聊聊内容", None, "t")
+    mR = PendingMessage(rid, 9500, cidR, 31, "某群友", "随便聊聊内容", None, "t")
+    await pR.submit(mR)
+    print("      波次中普通消息 fast=%s（应 True，波次期间压缩响应时间）"
+          % mR.fast)
+    assert mR.fast, "波次期间所有消息应走快车道"
+
     os.unlink(tmp)
     print("\n全部通过")
 

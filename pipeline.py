@@ -40,6 +40,8 @@ from detector_rules import (
     check_repeat,
     check_triggers,
     compute_trust,
+    RaidDetector,
+    RAID_BASELINE_DEFAULT,
     load_patterns,
     record_shadow_hits,
     trust_marker,
@@ -151,6 +153,9 @@ class ChatPipeline:
         self._history_cache: dict[int, tuple[float, list[str]]] = {}
         self._admin_cache: tuple[float, set[int]] = (0.0, set())
         self._managed_cache: tuple[float, set[str]] = (0.0, set())
+        # 群级波次检测：逐条判定看不到"105 个账号同时投放"这类协作攻击
+        self._raid = RaidDetector(baseline=RAID_BASELINE_DEFAULT)
+        self._raid_alerted = 0.0
         self.last_error: str | None = None
 
     # -- 配置读取 ---------------------------------------------------------
@@ -342,11 +347,18 @@ class ChatPipeline:
 
         # --- 分流 ---
         cut = cfg["confidence_cut"]
+        # 波次状态由 _judge 在真正判删时更新；这里只读取。
+        # 波次期间全部走快车道，把响应时间压到最低——批量投放时
+        # 每一秒的延迟都意味着更多群友看到广告。
+        raid_now = self._raid.in_raid()
+        if raid_now:
+            # 收紧幅度刻意保守（0.10），避免攻击者故意制造"假波次"诱导误伤
+            cut = max(0.30, cut - 0.10)
         # 不可见字符占比高：广告号的强特征，插队到快车道
         suspicious = (len(msg.text) >= INVISIBLE_MIN_LENGTH
                       and invisible_ratio(msg.text) >= INVISIBLE_RATIO_THRESHOLD)
         msg.fast = (trust in FASTLANE_TRUST_LEVELS or suspicious
-                    or bool(triggers))
+                    or bool(triggers) or raid_now)
         if level == "advertiser":
             msg.fast = False  # 付费商家不抢快车道资源
 
@@ -547,6 +559,10 @@ class ChatPipeline:
             # 付费商家用更高的门槛：只删"铁证"级广告（诈骗/黑产/外部推销），
             # 放过他们付费购买的招揽权。否则白名单等于投毒通道。
             threshold = max(cut, ADVERTISER_CUT) if m.whitelist == "advertiser" else cut
+            # 波次期间收紧判定：广告正在批量涌入，宁可多删也不漏。
+            # 幅度刻意保守（0.10），避免攻击者故意制造"假波次"来诱导误伤。
+            if self._raid.in_raid():
+                threshold = max(0.30, threshold - 0.10)
             is_spam = conf >= threshold
             verdicts.append(Verdict(m, is_spam, conf, "llm"))
 
@@ -569,6 +585,22 @@ class ChatPipeline:
                     db.add_fewshot, self.chat_id, "positive", m.text, "report")
 
         spam = [v for v in verdicts if v.is_spam]
+
+        # 记录删除事件，供波次检测使用。
+        # 必须在这里记（真正判定为广告的时刻），不能在 submit 里记——
+        # submit 只是入队，此时还不知道结果。
+        for _v in spam:
+            self._raid.record_delete()
+        in_raid, raid_n, raid_thr = self._raid.check()
+        if in_raid:
+            _now = time.time()
+            if _now - self._raid_alerted > 300:      # 5 分钟最多告警一次
+                self._raid_alerted = _now
+                logger.warning(
+                    "波次警戒 chat=%s 近 %ds 内删除 %d 条（阈值 %d）——"
+                    "疑似协调投放，降低门槛并加快响应",
+                    self.chat_id, self._raid.window, raid_n, raid_thr)
+
         if not spam:
             return
 
