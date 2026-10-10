@@ -700,6 +700,9 @@ async def preflight() -> int:
 
     # 1. 数据库
     try:
+        _d = os.path.dirname(os.path.abspath(DB_PATH))
+        if _d and not os.path.isdir(_d):
+            os.makedirs(_d, exist_ok=True)
         db.init_db(DB_PATH)
         import sqlite3
         conn = sqlite3.connect(DB_PATH)
@@ -786,6 +789,13 @@ def main() -> None:
 
     if not ADMIN_ID:
         logger.warning("未设置 ADMIN_ID，将无法接收通知")
+
+    # SQLite 不会自动创建父目录。compose 里 DB_NAME=/app/data/antispam.db，
+    # 挂载的空卷首次启动时 data/ 可能不存在，不建就会直接崩。
+    db_dir = os.path.dirname(os.path.abspath(DB_PATH))
+    if db_dir and not os.path.isdir(db_dir):
+        os.makedirs(db_dir, exist_ok=True)
+        logger.info("已创建数据库目录: %s", db_dir)
 
     db.init_db(DB_PATH)
 
