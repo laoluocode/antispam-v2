@@ -346,6 +346,58 @@ async def main():
           % check_external_channel_link(
               "https://t.me/wuhanjp 和 https://t.me/wdgx", managed).hit)
 
+    print("=== 15. 回归：编辑消息重新判定 / 按钮 / 全局黑名单 ===")
+    from detector_rules import check_inline_buttons
+
+    cid5 = -600
+    db.register_chat(cid5, "编辑测试群", "general", shadow_mode=False)
+    db.set_chat_field(cid5, "shadow_mode", 0)
+    db.set_chat_field(cid5, "username", "testgroup")
+    db.set_chat_field(cid5, "managed_links", "testgroup,ourchannel")
+
+    # (a) 编辑消息：正文更新 + 重置为未检测
+    rid = db.save_message(cid5, 9001, 7, "某人", "今天天气不错", None,
+                          "2026-10-10 15:00:00")
+    db.take_unchecked_batch(cid5, 10)          # 假装判过了
+    row = db.get_message(cid5, 9001)
+    print("  (a) 编辑前 is_checked=%s text=%r" % (row["is_checked"], row["text"]))
+    ok = db.remark_message(cid5, 9001, "加我 t.me/spamchannel 领福利")
+    row = db.get_message(cid5, 9001)
+    print("      编辑后 is_checked=%s text=%r" % (row["is_checked"], row["text"]))
+    assert ok and row["is_checked"] == 0, "编辑后应重置为未检测以便重新判定"
+    print("      -> 编辑会触发重新判定")
+
+    # (b) 编辑后的内容应被 L0 抓到（外部频道）
+    from detector_rules import check_external_channel_link
+    managed = db.managed_links(cid5)
+    v = check_external_channel_link(row["text"], managed)
+    print("  (b) 编辑后内容判定: %s (%s)" % ("命中" if v.hit else "放行", v.reason))
+    assert v.hit, "编辑成外部频道链接应被 L0 抓到"
+
+    # (c) inline 按钮
+    v = check_inline_buttons(["加入频道"], ["https://t.me/spamchannel"], managed)
+    print("  (c) 外部频道按钮: %s (%s)" % ("命中" if v.hit else "放行", v.reason))
+    assert v.hit
+    v = check_inline_buttons(["查看榜单"], ["https://t.me/ourchannel"], managed)
+    print("      自家频道按钮: %s (应放行)" % ("命中" if v.hit else "放行"))
+    assert not v.hit
+    v = check_inline_buttons(["领取福利"], [], managed)
+    print("      纯引导文案按钮: %s (%s)" % ("命中" if v.hit else "放行", v.reason))
+    assert v.hit
+
+    # (d) 全局黑名单跨群生效
+    print("  (d) 全局黑名单跨群生效:")
+    cid6 = -700
+    db.register_chat(cid6, "另一个群", "general", shadow_mode=False)
+    print("      A群黑名单前，B群可见:", db.blacklist_ids(cid6))
+    db.global_blacklist_add(999888, "惯犯", "测试", cid5)
+    print("      加入全局黑名单后，B群可见:", db.blacklist_ids(cid6))
+    assert 999888 in db.blacklist_ids(cid6), "全局黑名单应对所有群生效"
+    assert 999888 in db.blacklist_ids(cid5), "全局黑名单应对本群也生效"
+    print("      全局黑名单条目:", len(db.global_blacklist_list()))
+    db.global_blacklist_remove(999888)
+    print("      移除后 B群可见:", db.blacklist_ids(cid6))
+
     os.unlink(tmp)
     print("\n全部通过")
 

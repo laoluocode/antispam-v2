@@ -42,7 +42,33 @@ from telegram.ext import (
 
 import db
 from deepseek import DeepSeekClient
-from detector_rules import compute_trust, trust_marker
+from detector_rules import (
+    check_inline_buttons,
+    compute_trust,
+    extract_tme_identifiers,
+    trust_marker,
+)
+
+
+def _extract_buttons(msg) -> tuple[list[str], list[str]]:
+    """抽取消息的 inline 按钮文案与 URL。
+
+    广告号把广告做成按钮，正文因此可以完全干净——纯文本检测看不到。
+    """
+    texts, urls = [], []
+    rm = getattr(msg, "reply_markup", None)
+    if rm is None:
+        return texts, urls
+    rows = getattr(rm, "inline_keyboard", None) or []
+    for row in rows:
+        for btn in (row or []):
+            t = getattr(btn, "text", None)
+            u = getattr(btn, "url", None)
+            if t:
+                texts.append(str(t)[:60])
+            if u:
+                urls.append(str(u))
+    return texts, urls
 from link_preview import has_link_preview, preview_fingerprint
 from pipeline import PendingMessage, PipelineManager, Verdict
 from prompts import NATURE_PRESETS
@@ -386,6 +412,41 @@ async def _delete_verdict(bot, v: Verdict) -> None:
                              message_id=v.message.message_id)
 
 
+# 同一账号在本群被删多少次后推入全局黑名单（跨群生效）。
+# 实测依据：同一批广告号同时打多个群（南京苏州集团与武汉集团同期出现同一套
+# "招募探花"广告）。A 群确认过的号在 B 群当场生效，不必各自重新踩一遍——
+# 群越多，每个群越安全。
+GLOBAL_BLACKLIST_AFTER = 5
+
+
+async def _maybe_global_blacklist(bot, chat_id: int, user_id: int,
+                                  full_name: str | None, reason: str) -> None:
+    """本群删除次数达阈值 -> 加入全局黑名单，所有群立刻生效。"""
+    try:
+        st = await asyncio.to_thread(db.user_stats, chat_id, user_id)
+        if st["del_n"] < GLOBAL_BLACKLIST_AFTER:
+            return
+        if await asyncio.to_thread(db.global_blacklist_has, user_id):
+            return
+        await asyncio.to_thread(
+            db.global_blacklist_add, user_id, full_name,
+            f"本群删除 {st['del_n']} 次：{reason[:40]}", chat_id)
+
+        chats = await asyncio.to_thread(db.list_active_chats)
+        logger.warning("加入全局黑名单 user=%s(%s) 本群已删 %d 次",
+                       full_name, user_id, st["del_n"])
+        names = "、".join(str(c["title"] or c["chat_id"]) for c in chats[:6])
+        await _send_admin(
+            bot,
+            f"🌐 已加入全局黑名单（{len(chats)} 个群立即生效）\n"
+            f"用户：{full_name}（{user_id}）\n"
+            f"原因：本群已删除 {st['del_n']} 次\n"
+            f"生效群：{names}\n\n"
+            f"移出：manage.py gbl --remove {user_id}")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("全局黑名单写入失败 user=%s: %s", user_id, exc)
+
+
 def _spam_keyboard(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("↩️ 误删，恢复并加白",
@@ -550,6 +611,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if user.is_bot:
         return
 
+    # ── 编辑消息：必须重新判定 ──────────────────────────────────────
+    # 经典规避手法（The Edit Trick）：先发一条正常消息，过一段时间再编辑成
+    # 广告/诈骗链接。绝大多数机器人只在消息到达时检查一次，编辑后就不再管。
+    # Telegram 会把编辑作为 edited_message 推过来，这里的处理是把消息
+    # 重新置为未检测并复用正常流程。
+    if update.edited_message is not None:
+        await _handle_edited(update, context, chat.id, user, msg)
+        return
+
     # 私聊：转发消息 = 举报
     if chat.type == "private":
         await _handle_forwarded_report(update, context)
@@ -632,12 +702,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         logger.info("预览指纹 chat=%s msg=%s fp=%s url=%s",
                     chat.id, msg.message_id, fp, purl[:80])
 
+    btns, burls = _extract_buttons(msg)
+    if btns or burls:
+        logger.info("消息带按钮 chat=%s msg=%s texts=%s urls=%s",
+                    chat.id, msg.message_id, btns[:3], burls[:2])
+
     pending = PendingMessage(
         row_id=row_id, message_id=msg.message_id, chat_id=chat.id,
         user_id=user.id, full_name=user.full_name, text=text,
         reply_to=msg.reply_to_message.message_id if msg.reply_to_message else None,
         timestamp=ts,
         preview_fp=fp, preview_url=purl, has_preview=has_link_preview(msg),
+        button_texts=btns, button_urls=burls,
     )
 
     pipeline = _manager.get(chat.id, on_spam=_make_on_spam(context.application),
@@ -648,6 +724,57 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # L0 命中：立即删除，不等 LLM
     if verdict and verdict.is_spam:
         await _apply_verdict(context.application, verdict)
+
+
+async def _handle_edited(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                         chat_id: int, user, msg) -> None:
+    """处理消息被编辑的情况。
+
+    做三件事：
+      1. 把库里那条消息的正文更新为编辑后的内容，并重置为未检测
+      2. 若编辑后内容命中 L0 规则或判定为广告 -> 删除
+      3. 记录日志，便于观察是否有人在用这个手法
+
+    注意 Telegram 只下发编辑后的内容，编辑前的原文拿不到，
+    所以这里只能"重新判定新内容"。原内容可在 spam_records 里事后比对。
+    """
+    row = await asyncio.to_thread(db.get_chat, chat_id)
+    if not row or not row["is_active"]:
+        return
+
+    text = msg.text or msg.caption
+    if not text:
+        return
+
+    old_row = await asyncio.to_thread(db.get_message, chat_id, msg.message_id)
+    old_text = (old_row["text"] if old_row else "") or ""
+    if old_text.strip() == text.strip():
+        return  # 编辑没改内容（例如只改了格式），不重复判定
+
+    logger.warning("消息被编辑 chat=%s msg=%s user=%s\n  旧: %r\n  新: %r",
+                   chat_id, msg.message_id, user.id,
+                   old_text[:80], text[:80])
+
+    # 重置为未检测，让正常流程重新判；同时更新正文
+    await asyncio.to_thread(
+        db.remark_message, chat_id, msg.message_id, text)
+
+    pipeline = _manager.get(chat_id, on_spam=_make_on_spam(context.application),
+                            notify=_make_notify(context.application),
+                            on_log=_make_on_log(context.application))
+    if old_row is None:
+        return
+    pending = PendingMessage(
+        row_id=old_row["id"], message_id=msg.message_id, chat_id=chat_id,
+        user_id=user.id, full_name=user.full_name, text=text,
+        reply_to=None, timestamp=old_row["timestamp"],
+        origin="edited",
+    )
+    # 编辑是高风险行为，直接走快车道
+    pending.fast = True
+    async with pipeline._lock:  # noqa: SLF001
+        pipeline._fast.appendleft(pending)  # noqa: SLF001
+
 
 
 async def _handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE,
@@ -694,6 +821,12 @@ async def _handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE,
 def _make_on_spam(app: Application):
     async def on_spam(v: Verdict) -> None:
         await _delete_verdict(app.bot, v)
+        # 删除次数累计由 pipeline 负责（它在删除成功后调 bump_user_deleted），
+        # 这里只做跨群联动判定，所以放在后面。
+        await _maybe_global_blacklist(app.bot, v.message.chat_id,
+                                      v.message.user_id,
+                                      v.message.full_name,
+                                      f"AI判定 {v.confidence:.2f}")
     return on_spam
 
 
@@ -726,6 +859,9 @@ async def _apply_verdict(app: Application, v: Verdict) -> None:
             await asyncio.to_thread(db.bump_user_deleted, v.message.chat_id,
                                     v.message.user_id, v.message.full_name)
             logger.info("L0 删除 msg=%s reason=%s", v.message.message_id, v.reason)
+            await _maybe_global_blacklist(app.bot, v.message.chat_id,
+                                          v.message.user_id,
+                                          v.message.full_name, v.reason)
         except Exception as exc:  # noqa: BLE001
             logger.warning("L0 删除失败 msg=%s: %s", v.message.message_id, exc)
     if row and row["notify_admin"]:
@@ -1419,6 +1555,13 @@ def main() -> None:
     app.add_handler(CommandHandler("recent", cmd_recent))
     app.add_handler(CommandHandler("revive", cmd_revive))
     app.add_handler(CallbackQueryHandler(on_callback))
+    # 一个 handler 同时覆盖新消息与编辑消息：
+    # filters.check_update 基于 Update.effective_message，而 effective_message
+    # 在 message 为空时会取 edited_message，所以编辑消息也会进到这里。
+    # handle_message 里用 update.edited_message 区分两条路径。
+    #
+    # 注意：add_handler 默认都在 group 0，而一个 group 内只有**第一个匹配的**
+    # handler 会被调用。所以这里注册两次是无效的（第二次永远不会执行）。
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
 

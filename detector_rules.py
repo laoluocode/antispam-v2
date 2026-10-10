@@ -275,6 +275,61 @@ def check_external_channel_link(text: str, managed: set[str]) -> Verdict:
     return _NO_HIT
 
 
+# 广告按钮的文案特征。广告号常把"加入频道/领取奖励"做成 inline 按钮，
+# 正文很干净（甚至只有一个表情），按钮才是那个广告。
+_AD_BUTTON_PATTERN = re.compile(
+    r"(加入|点击|领取|立即|马上|查看|进入|申请|咨询|联系|开户|注册|下载|开始|获取|"
+    r"join|click|claim|start|open|register|download|visit|apply|contact"
+    r")\s*(频道|群组|群|频道|链接|这里|我|奖励|福利|红包|彩金|名额|客服|网站|APP|app|"
+    r"channel|group|link|here|now|bonus|reward)?",
+    re.IGNORECASE,
+)
+
+# 按钮 URL 指向的链接同样受"外部频道"规则约束，这里只做基础识别
+_BUTTON_URL_PATTERN = re.compile(r"https?://|t\.me/", re.IGNORECASE)
+
+
+def check_inline_buttons(button_texts: list[str],
+                         button_urls: list[str],
+                         managed: set[str]) -> Verdict:
+    """检测消息附带的 inline 按钮。
+
+    为什么需要：广告号把广告做成按钮——正文可以只是一个表情，
+    按钮写"加入频道｜领取福利"。这类消息在文本层完全干净，
+    keyword/LLM 都看不出来。
+
+    命中条件（任一）：
+      · 按钮 URL 指向非本群体系的外部 t.me 目标（与外部频道规则同源）
+      · 按钮文案是明确的广告引导语（加入频道/领取奖励…）
+
+    正常运营的按钮（"查看榜单"指向自家频道）不会命中。
+    """
+    if not button_texts and not button_urls:
+        return _NO_HIT
+
+    # 1) 按钮 URL 指向外部
+    for url in button_urls:
+        ids = extract_tme_identifiers(url)
+        if ids and not (ids & {m.lower() for m in managed}):
+            return Verdict(True, f"按钮指向外部频道（{list(ids)[0]}）")
+        # 非 Telegram 的外部链接 + 广告引导文案
+        if _BUTTON_URL_PATTERN.search(url) and not url.lower().startswith(
+                ("https://t.me/", "http://t.me/", "tg://")):
+            for t in button_texts:
+                if _AD_BUTTON_PATTERN.search(t):
+                    return Verdict(True, f"按钮引导站外链接（{t[:12]}）")
+
+    # 2) 按钮文案是广告引导语
+    for t in button_texts:
+        tt = (t or "").strip()
+        if len(tt) <= 24 and _AD_BUTTON_PATTERN.search(tt):
+            # 需要同时带"渠道"类词或为纯引导，避免把"查看"这类中性按钮误伤
+            if re.search(r"(频道|群组|群|链接|奖励|福利|红包|彩金|名额|客服|"
+                         r"channel|group|link|bonus|reward)", tt, re.I):
+                return Verdict(True, f"广告按钮（{tt[:14]}）")
+    return _NO_HIT
+
+
 def check_repeat(text: str, recent_texts: list[str], threshold: int = 3) -> Verdict:
     """重复刷屏检测。
 

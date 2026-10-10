@@ -33,6 +33,7 @@ from detector_rules import (
     INVISIBLE_RATIO_THRESHOLD,
     check_bare_letter_spam,
     check_external_channel_link,
+    check_inline_buttons,
     check_local,
     check_repeat,
     compute_trust,
@@ -91,6 +92,9 @@ class PendingMessage:
     preview_fp: str = ""
     preview_url: str = ""
     has_preview: bool = False
+    # inline 按钮：广告号把广告做成按钮，正文可以只是一个表情
+    button_texts: list[str] = field(default_factory=list)
+    button_urls: list[str] = field(default_factory=list)
 
     @property
     def marker(self) -> str:
@@ -226,6 +230,14 @@ class ChatPipeline:
         if v.hit:
             await asyncio.to_thread(db.mark_checked, [msg.row_id])
             return Verdict(msg, True, 1.0, "local_rule", v.reason)
+
+        # --- inline 按钮检测 ---
+        # 广告号把广告做成按钮（"加入频道｜领取福利"），正文可以完全干净。
+        if msg.button_texts or msg.button_urls:
+            bv = check_inline_buttons(msg.button_texts, msg.button_urls, managed)
+            if bv.hit:
+                await asyncio.to_thread(db.mark_checked, [msg.row_id])
+                return Verdict(msg, True, 1.0, "local_rule", bv.reason)
 
         # --- 外部频道链接检测 ---
         # 这些群有"集团"式频道体系，群友转发自家频道是常态。广告号借这个习惯

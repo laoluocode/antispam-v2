@@ -132,6 +132,35 @@ def cmd_words(args) -> None:
         print("  manage.py words -100xxx          # 只看当前词表")
 
 
+def cmd_gbl(args) -> None:
+    """全局黑名单：跨群生效的账号黑名单。
+
+    为什么需要：同一批广告号会同时打多个群（实测：南京苏州集团与武汉集团
+    同期出现同一套广告）。某个群确认过的号，其他群当场就拦截，
+    不必各自重新踩一遍——群越多，每个群越安全。
+    本群删除次数达到阈值的账号会自动进入此表。
+    """
+    if args.remove:
+        ok = db.global_blacklist_remove(args.remove)
+        print("已移出全局黑名单" if ok else "不在全局黑名单中")
+    if args.add:
+        db.global_blacklist_add(args.add, None, "管理员手工加入", 0)
+        print(f"已加入全局黑名单: {args.add}")
+
+    rows = db.global_blacklist_list(200)
+    if not rows:
+        print("全局黑名单为空。")
+    else:
+        print(f"全局黑名单（{len(rows)} 人，对所有群生效）:")
+        print(f"  {'user_id':>14} {'命中群数':>7}  昵称 / 原因")
+        print("  " + "-" * 72)
+        for r in rows:
+            print(f"  {r['user_id']:>14} {r['hits']:>7}  "
+                  f"{str(r['full_name'] or '')[:16]:16s} {str(r['reason'] or '')[:34]}")
+    print()
+    print("用法：manage.py gbl [--add <user_id>] [--remove <user_id>]")
+
+
 def cmd_links(args) -> None:
     """查看/设置本群体系的频道标识。
 
@@ -236,6 +265,11 @@ def main() -> None:
 
     c = sub.add_parser("list", help="列出所有群")
     c.set_defaults(func=cmd_list)
+
+    g = sub.add_parser("gbl", help="全局黑名单（跨群生效）")
+    g.add_argument("--add", type=int, help="加入一个 user_id")
+    g.add_argument("--remove", type=int, help="移出一个 user_id")
+    g.set_defaults(func=cmd_gbl)
 
     f = sub.add_parser("links", help="查看/设置本群体系的频道标识")
     f.add_argument("chat_id", type=int)

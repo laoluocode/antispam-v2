@@ -231,6 +231,19 @@ CREATE TABLE IF NOT EXISTS preview_senders (
     PRIMARY KEY (chat_id, fingerprint, user_id)
 );
 
+-- 全局黑名单：跨群联动。
+-- 同一批广告号会同时打多个群（实测：南京苏州集团与武汉集团同期出现
+-- 同一套"招募探花"广告）。在 A 群确认的广告号，B 群应立刻生效，
+-- 不必各自重新踩一遍。
+CREATE TABLE IF NOT EXISTS global_blacklist (
+    user_id    INTEGER PRIMARY KEY,
+    full_name  TEXT,
+    reason     TEXT,
+    origin_chat INTEGER,                 -- 首次确认的群
+    hits       INTEGER DEFAULT 0,        -- 在多少个群被确认过
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 被丢弃的消息（诊断用，回答"为什么这条没被处理"）
 CREATE TABLE IF NOT EXISTS dropped_messages (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -645,6 +658,25 @@ def bump_retry(row_ids: list[int]) -> list[int]:
     return keep
 
 
+def get_message(chat_id: int, message_id: int):
+    return query_one("SELECT * FROM messages WHERE chat_id=? AND message_id=?",
+                     (chat_id, message_id))
+
+
+def remark_message(chat_id: int, message_id: int, text: str) -> bool:
+    """编辑后更新正文并重置为未检测，让流水线重新判。
+
+    The Edit Trick：先发正常消息，过段时间编辑成广告。不在编辑后重新判定
+    就等于给广告号留了稳定的后门。
+    """
+    with tx() as conn:
+        cur = conn.execute(
+            """UPDATE messages SET text=?, is_checked=0, retry_count=0
+               WHERE chat_id=? AND message_id=?""",
+            (text, chat_id, message_id))
+        return cur.rowcount > 0
+
+
 def recent_user_texts(chat_id: int, user_id: int, limit: int = 6) -> list[str]:
     """该用户近期发言，用作判定上下文。新到旧。"""
     rows = query("""SELECT text FROM messages WHERE chat_id=? AND user_id=?
@@ -783,8 +815,45 @@ def blacklist_remove(chat_id: int, user_id: int) -> bool:
 
 
 def blacklist_ids(chat_id: int) -> set[int]:
-    return {r["user_id"] for r in
-            query("SELECT user_id FROM spam_blacklist WHERE chat_id=?", (chat_id,))}
+    """本群黑名单 + 全局黑名单。
+
+    跨群联动的价值（实测依据）：同一批广告号会同时打多个群，
+    A 群确认过的号在 B 群当场就生效，不必各自重新踩一遍。
+    这是"网络效应"——群越多，每个群越安全。
+    """
+    local = {r["user_id"] for r in
+             query("SELECT user_id FROM spam_blacklist WHERE chat_id=?", (chat_id,))}
+    glob = {r["user_id"] for r in query("SELECT user_id FROM global_blacklist")}
+    return local | glob
+
+
+def global_blacklist_add(user_id: int, full_name: str | None, reason: str,
+                         origin_chat: int) -> None:
+    """加入全局黑名单（跨群生效）。"""
+    execute("""
+        INSERT INTO global_blacklist (user_id, full_name, reason, origin_chat, hits)
+        VALUES (?,?,?,?,1)
+        ON CONFLICT(user_id) DO UPDATE SET
+            hits = hits + 1,
+            reason = excluded.reason,
+            full_name = COALESCE(excluded.full_name, global_blacklist.full_name)
+    """, (user_id, full_name, reason, origin_chat))
+
+
+def global_blacklist_remove(user_id: int) -> bool:
+    with tx() as conn:
+        return conn.execute("DELETE FROM global_blacklist WHERE user_id=?",
+                            (user_id,)).rowcount > 0
+
+
+def global_blacklist_list(limit: int = 100) -> list[sqlite3.Row]:
+    return query("SELECT * FROM global_blacklist ORDER BY hits DESC, created_at DESC "
+                 "LIMIT ?", (limit,))
+
+
+def global_blacklist_has(user_id: int) -> bool:
+    return query_one("SELECT 1 FROM global_blacklist WHERE user_id=?",
+                     (user_id,)) is not None
 
 
 # --------------------------------------------------------------------------
