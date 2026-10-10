@@ -36,6 +36,7 @@ from telegram.ext import (
     CommandHandler,
     ContextTypes,
     MessageHandler,
+    ChatMemberHandler,
     filters,
 )
 
@@ -121,6 +122,33 @@ async def _is_cached_admin(chat_id: int, user_id: int) -> bool:
     return user_id in set()
 
 
+async def _send_admin(bot, text: str, **kw) -> bool:
+    """发消息给管理员。
+
+    Telegram 不允许机器人主动给「从未与它对话过」的用户发消息，会抛
+    Chat not found。这个错误对使用者毫无提示性，所以单独翻译成操作指引。
+    所有管理员通知都走这里，避免每处都重复判断。
+    """
+    if not ADMIN_ID:
+        return False
+    try:
+        await bot.send_message(chat_id=ADMIN_ID, text=text, **kw)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        msg = str(exc)
+        tail = ""
+        if "Chat not found" in msg or "chat not found" in msg:
+            try:
+                me = await bot.get_me()
+                tail = (f"\n  -> 请用你的账号打开 https://t.me/{me.username} "
+                        f"并点 Start（机器人无法主动给从未对话过的用户发消息）")
+            except Exception:  # noqa: BLE001
+                tail = "\n  -> 请先与机器人私聊并点 Start"
+        logger.warning("管理员通知发送失败: %s%s", msg, tail)
+        return False
+
+
+
 # ---------------------------------------------------------------------------
 # 删除执行
 # ---------------------------------------------------------------------------
@@ -165,12 +193,80 @@ async def _notify_spam(bot, verdicts: list[Verdict], shadow: bool) -> None:
         kb = None
         if not shadow and items:
             kb = _spam_keyboard(chat_id, items[0].message.user_id)
+        await _send_admin(bot, "\n".join(lines), reply_markup=kb,
+                          disable_web_page_preview=True)
+
+
+# 自动注册时使用的默认值。
+# 阈值 0.50 是离线实测 F1 最优档（召回 95.5% / 精确 89.3%）。
+# 群性质默认 general（最保守的表征），群主确认后可改。
+AUTO_REGISTER_CUT = 0.50
+AUTO_REGISTER_NATURE = "general"
+
+
+async def _auto_register(app: Application, chat, added_by: int | None) -> bool:
+    """机器人被拉进群时自动注册并通知管理员。
+
+    为什么不要求手动注册：拉群后如果不注册，handle_message 会直接 return，
+    一个字的上下文都不会收集——用户以为在跑，实际什么都没记。
+    自动注册后可用 manage.py 调整性质与严格度。
+    """
+    if chat.type not in ("group", "supergroup"):
+        return False
+    row = await asyncio.to_thread(db.get_chat, chat.id)
+    if row:
+        return False
+
+    await asyncio.to_thread(db.register_chat, chat.id, chat.title or "",
+                            AUTO_REGISTER_NATURE, shadow_mode=False)
+    await asyncio.to_thread(db.set_chat_field, chat.id, "confidence_cut",
+                            AUTO_REGISTER_CUT)
+    await asyncio.to_thread(db.set_chat_field, chat.id, "strictness", "standard")
+
+    # 立刻拉一次管理员列表，避免首条消息被群主自己触发判定
+    await _refresh_admins(app, chat.id)
+
+    logger.info("自动注册新群 chat=%s title=%s", chat.id, chat.title)
+    if ADMIN_ID:
         try:
-            await bot.send_message(chat_id=ADMIN_ID, text="\n".join(lines),
-                                   reply_markup=kb,
-                                   disable_web_page_preview=True)
+            me = await app.bot.get_me()
+            await _send_admin(app.bot, ("🆕 已自动注册新群\n"
+                      f"群名：{chat.title}\n"
+                      f"ID：{chat.id}\n"
+                      f"阈值：{AUTO_REGISTER_CUT}（实测最优档）\n"
+                      f"性质：{AUTO_REGISTER_NATURE}\n\n"
+                      f"必须把 @{me.username} 设为管理员并给「删除消息」权限，"
+                      f"否则判定无法执行。\n\n"
+                      f"调整：python manage.py set {chat.id} --nature adult_service"))
         except Exception as exc:  # noqa: BLE001
-            logger.warning("通知失败: %s", exc)
+            logger.warning("自动注册通知失败: %s", exc)
+    return True
+
+
+async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """机器人自身的成员状态变化：被拉进群 / 被提升为管理员 / 被踢出。"""
+    cm = update.my_chat_member
+    if not cm or not update.effective_chat:
+        return
+    chat = update.effective_chat
+    new_status = cm.new_chat_member.status
+    actor = cm.from_user.id if cm.from_user else None
+
+    if new_status in ("member", "administrator"):
+        await _auto_register(context.application, chat, actor)
+    elif new_status in ("left", "kicked"):
+        row = await asyncio.to_thread(db.get_chat, chat.id)
+        if row and row["is_active"]:
+            await asyncio.to_thread(db.set_chat_field, chat.id, "is_active", 0)
+            logger.info("机器人已离开群 chat=%s，已停用", chat.id)
+            await _send_admin(
+                context.bot,
+                f"⚠️ 机器人已离开群 {chat.title}（{chat.id}），已停用该群。")
+
+    # 成为管理员后立刻刷新管理员列表
+    if new_status == "administrator":
+        await _refresh_admins(context.application, chat.id)
+
 
 
 # ---------------------------------------------------------------------------
@@ -332,9 +428,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if chat and chat.type in ("group", "supergroup"):
         row = await asyncio.to_thread(db.get_chat, chat.id)
         if not row:
+            # my_chat_member 事件可能丢失（例如机器人先被拉进群、后重启）。
+            # /start 兜底注册，避免"以为在跑实际什么都没记"。
+            await _auto_register(context.application, chat,
+                                 update.effective_user.id if update.effective_user else None)
+            row = await asyncio.to_thread(db.get_chat, chat.id)
+        if not row:
             await update.effective_message.reply_text(
-                "本群尚未注册。请管理员在私聊中把群 ID 发给机器人所有者，"
-                "或直接使用 /admin 面板开启。"
+                "本群尚未注册，且自动注册未成功。请联系机器人所有者。"
             )
             return
         state = "影子模式（只记录不删除）" if row["shadow_mode"] else "已启用删除"
@@ -632,13 +733,8 @@ async def job_heartbeat_check(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     for cid, p in _manager._pipelines.items():  # noqa: SLF001
         if p.last_error:
-            try:
-                await context.bot.send_message(
-                    chat_id=ADMIN_ID,
-                    text=f"⚠️ 群 {cid} 判定异常：{p.last_error}",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            await _send_admin(context.bot,
+                              f"⚠️ 群 {cid} 判定异常：{p.last_error}")
             p.last_error = None
 
 
@@ -665,18 +761,17 @@ async def post_init(app: Application) -> None:
     for cid in ids:
         await _refresh_admins(app, cid)
 
-    logger.info("已上线，模型=%s，服务 %d 个群", MODEL_NAME, len(ids))
-    if ADMIN_ID:
-        try:
-            await app.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(f"🤖 反广告机器人已上线\n模型：{MODEL_NAME}\n"
-                      f"服务群数：{len(ids)}\n"
-                      f"数据库：{DB_PATH}\n"
-                      f"注意：影子模式为默认，确认无误后再关。"),
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.error("启动通知失败: %s", exc)
+    logger.info("已上线，模型=%s，服务 %d 个群（未注册的群会被自动注册）",
+                MODEL_NAME, len(ids))
+    await _send_admin(
+        app.bot,
+        (f"🤖 反广告机器人已上线\n"
+         f"模型：{MODEL_NAME}\n"
+         f"服务群数：{len(ids)}\n"
+         f"判定阈值：{AUTO_REGISTER_CUT}（实测最优档）\n"
+         f"数据库：{DB_PATH}\n\n"
+         f"把机器人拉进群即可自动注册，无需手动操作。"),
+    )
 
 
 async def post_shutdown(app: Application) -> None:
@@ -805,6 +900,10 @@ def main() -> None:
            .post_shutdown(post_shutdown)
            .build())
 
+    # 机器人自身的成员变化（被拉进群/成为管理员/被踢出）用 ChatMemberHandler
+    # 配 MY_CHAT_MEMBER 过滤器。没有 MyChatMemberHandler 这个类。
+    app.add_handler(ChatMemberHandler(on_my_chat_member,
+                                     ChatMemberHandler.MY_CHAT_MEMBER))
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("admin", cmd_admin))
     app.add_handler(CommandHandler("wl", cmd_wl))

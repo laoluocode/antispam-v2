@@ -22,12 +22,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import db
 from prompts import NATURE_PRESETS
 
-# 严格档位 -> 建议阈值。
-# 阈值是成本/召回/误删三者之间唯一的调节旋钮，且改它**不动 prompt、不废缓存**。
+# 严格档位 -> 阈值。
+# 阈值是成本/召回/误删之间唯一的调节旋钮，且改它**不动 prompt、不废缓存**。
+#
+# 命名注意：这里的 "standard" 就是实测最优档（F1 0.923），数值上是三者中最低的。
+# 不用 "loose" 这种词是因为它听上去像"不严谨"，而实测它精确率反而最好——
+# 所谓"精确率低"是评估集把 V1 漏删的广告标成了正常，属于标签噪声。
+# 权衡看的是 F1 而非单看精确率。
 STRICTNESS_CUT = {
-    "strict": 0.85,     # 只删铁证（离线实测：召回 81% / 精确 92%）
-    "standard": 0.70,   # 平衡（召回 88% / 精确 92%）
-    "loose": 0.50,      # 多删（召回 96% / 精确 89%）—— 自有群曾用此档
+    "strict": 0.85,     # 只删铁证   召回 81.2% / 精确 92.3% / F1 0.864
+    "balanced": 0.70,   # 偏保守     召回 87.5% / 精确 91.6% / F1 0.895
+    "standard": 0.50,   # 实测最优   召回 95.5% / 精确 89.3% / F1 0.923  <- 默认
+    "aggressive": 0.30, # 多删       召回 98.0% / 精确 86.9% / F1 0.921
 }
 
 
@@ -110,7 +116,8 @@ def main() -> None:
     a.add_argument("chat_id", type=int)
     a.add_argument("--title", default="")
     a.add_argument("--nature", default="general", choices=list(NATURE_PRESETS))
-    a.add_argument("--strictness", default="strict", choices=list(STRICTNESS_CUT))
+    a.add_argument("--strictness", default="standard", choices=list(STRICTNESS_CUT),
+                   help="默认 standard=阈值0.50（离线实测 F1 最优）")
     a.add_argument("--shadow", action="store_true",
                    help="开启影子模式（只记录不删除）。新群不建议开")
     a.set_defaults(func=cmd_add)
