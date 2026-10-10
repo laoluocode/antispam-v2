@@ -42,11 +42,9 @@ from detector_rules import (
     compute_trust,
     RaidDetector,
     RAID_BASELINE_DEFAULT,
-    load_patterns,
     record_shadow_hits,
     trust_marker,
 )
-from link_preview import has_link_preview, preview_fingerprint
 from prompts import BATCH_INSTRUCTION, GLOBAL_PROMPT, build_fewshots, build_group_profile
 from utils.normalize import invisible_ratio
 
@@ -83,7 +81,6 @@ MIN_BATCH_SLOW = 40
 # 实测案例：两个账号交叉发单字母，指向同一个频道预览。
 # 正常群友分享同一链接的账号数远低于此。
 PREVIEW_SENDER_THRESHOLD = 3
-
 
 @dataclass
 class PendingMessage:
@@ -122,7 +119,6 @@ class PendingMessage:
     def marker(self) -> str:
         return trust_marker(self.trust)
 
-
 @dataclass
 class Verdict:
     """判定结果。"""
@@ -132,7 +128,6 @@ class Verdict:
     confidence: float
     source: str
     reason: str = ""
-
 
 class ChatPipeline:
     """单个群的检测流水线。每个群一个实例，互不干扰。"""
@@ -214,6 +209,37 @@ class ChatPipeline:
 
     # -- 入口：消息到达 ---------------------------------------------------
 
+    async def _hit(self, msg: PendingMessage, reason: str,
+                   source: str = "local_rule",
+                   confidence: float = 1.0) -> Verdict:
+        """L0 命中的统一出口。
+
+        所有确定性规则命中都走这里，避免每个检测点重复
+        mark_checked + log_verdict + record_shadow_hits + 构造 Verdict 四件事。
+        早先这些是逐处复制的（8 个检测点），既冗长又出过两类错：
+          · 有的地方漏了 log_verdict（判定记录缺失）
+          · 有的地方把 record_shadow_hits 写在了 return 之后（死代码）
+        """
+        await asyncio.to_thread(db.mark_checked, [msg.row_id])
+        await asyncio.to_thread(db.log_verdict, self.chat_id, msg.message_id,
+                                msg.user_id, confidence, source, True,
+                                ",".join(msg.triggers))
+        # L0 命中也是**真值已知**（确定是广告），必须计入 shadow 统计。
+        # 漏掉这一步会让 shadow 规则永远攒不够毕业所需的命中数——
+        # 越是规则能抓的广告，越不给规则贡献证据，形成自我阻碍。
+        try:
+            await asyncio.to_thread(record_shadow_hits, msg.text, True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("记录 shadow 命中失败: %s", exc)
+        return Verdict(msg, True, confidence, source, reason)
+
+    async def _skip(self, msg: PendingMessage, source: str = "local_rule",
+                    reason: str = "") -> None:
+        """明确放行：标记已检测 + 记判定，避免消息停留在未检测状态。"""
+        await asyncio.to_thread(db.mark_checked, [msg.row_id])
+        await asyncio.to_thread(db.log_verdict, self.chat_id, msg.message_id,
+                                msg.user_id, 0.0, source, False, reason)
+
     async def submit(self, msg: PendingMessage) -> Verdict | None:
         """处理一条消息。返回 L0 立即判定结果，或 None（已入队等 LLM）。"""
         cfg = self._cfg()
@@ -238,135 +264,71 @@ class ChatPipeline:
         msg.whitelist = level or ""
 
         # --- L0 确定性规则 ---
+        # 按确定性从高到低排：内容本体 > 行为特征 > 账号属性 > 关系特征。
+        managed = await self._managed_links()
         blacklist = await asyncio.to_thread(db.blacklist_ids, self.chat_id)
+
         v = check_local(msg.text, msg.user_id, self.chat_id, blacklist)
-        if not v.hit:
-            # 以下检测都需要该用户的近期发言
-            history = await self._history(msg.user_id)
-            if history:
-                v = check_repeat(msg.text, history, REPEAT_THRESHOLD)
-            # 单字符刷屏：广告号用裸字母当载体，广告内容在频道预览里，
-            # bot 只能拿到字母本身（实测漏判案例）。
-            #
-            # **不再按信任档位豁免。** 理由（借鉴 tg-spam 的设计）：
-            # "重复/行为类检测对所有用户生效，包括已批准用户——已批准用户
-            # 仍可能通过重复消息刷屏，这个模式应无视信任状态被检测。"
-            # 我们原来的豁免留了个缺口：老群友账号被盗后发裸字母完全不被拦。
-            #
-            # 误伤风险由白名单承担而非信任档位：白名单已涵盖 ok/no/hi/up/dd/
-            # thx/yes/id/qq/vx 与全部数字（实测老库 '1' 出现 282 次都是正常回应），
-            # 而"反复发不在白名单里的裸字母"本身就是异常行为。
-            if not v.hit:
-                v = check_bare_letter_spam(msg.text, history)
-
         if v.hit:
-            await asyncio.to_thread(db.mark_checked, [msg.row_id])
-            await asyncio.to_thread(db.log_verdict, self.chat_id,
-                                    msg.message_id, msg.user_id, 1.0,
-                                    "local_rule", True, ",".join(msg.triggers))
-            # L0 命中也是**真值已知**（确定是广告），所以同样要记 shadow 命中。
-            #
-            # 这是一个曾经自我阻碍的设计：原来只在 LLM 判定后记 shadow 命中，
-            # 而 L0 命中就提前 return 了——于是所有被 L0 拦下的广告
-            # **从未参与 shadow 统计**。实测后果：66 条 shadow 规则最高只攒到
-            # 3 次命中（毕业需 10 次），而同期删了 1845 条。
-            # 规则永远毕不了业，自进化形同虚设。
-            try:
-                await asyncio.to_thread(record_shadow_hits, msg.text, True)
-            except Exception:  # noqa: BLE001
-                pass
-            return Verdict(msg, True, 1.0, "local_rule", v.reason)
+            return await self._hit(msg, v.reason)
 
-        # --- 判定记忆（人工裁决过的内容直接复用结论）---
-        # 同一条广告被 ABC 三个账号发三遍，不该判三次、也不该让管理员看三次。
-        # 人工裁决一次之后，同类内容（含谐音/不可见字符变体，因为用了归一化哈希）
-        # 直接按已裁结论处理。
-        #   false_positive -> 放行（保护真人）
-        #   confirmed      -> 直删（0ms）
+        history = await self._history(msg.user_id)
+        if history:
+            v = check_repeat(msg.text, history, REPEAT_THRESHOLD)
+            if v.hit:
+                return await self._hit(msg, v.reason)
+            # 行为类检测**不按信任档位豁免**（借鉴 tg-spam）：
+            # 已批准用户仍可能刷屏，且老群友账号被盗后同样会发裸字母。
+            # 误伤风险由白名单承担（已含 ok/hi/no/dd 与全部数字）。
+            v = check_bare_letter_spam(msg.text, history)
+            if v.hit:
+                return await self._hit(msg, v.reason)
+
+        # 判定记忆：人工裁决过的内容直接复用结论，不必再判
+        # false_positive -> 放行（保护真人）；confirmed -> 直删
         memo = await asyncio.to_thread(db.recall_verdict, self.chat_id, msg.text)
         if memo == "false_positive":
-            await asyncio.to_thread(db.mark_checked, [msg.row_id])
-            await asyncio.to_thread(db.log_verdict, self.chat_id,
-                                    msg.message_id, msg.user_id, 0.0,
-                                    "memory", False, "人工判为误删")
-            logger.info("判定记忆放行 chat=%s msg=%s", self.chat_id,
-                        msg.message_id)
+            await self._skip(msg, "memory", "人工判为误删")
             return None
         if memo == "confirmed":
-            await asyncio.to_thread(db.mark_checked, [msg.row_id])
-            await asyncio.to_thread(db.log_verdict, self.chat_id,
-                                    msg.message_id, msg.user_id, 1.0,
-                                    "memory", True, "人工确认为广告")
-            return Verdict(msg, True, 1.0, "memory", "人工确认为广告")
+            return await self._hit(msg, "人工确认为广告", source="memory")
 
-        # --- 账号资料检测（昵称即广告位）---
-        # 放在内容规则之后：内容规则更确定（联系方式本体不会误伤），
-        # 资料规则的覆盖更广但依赖昵称习惯。
+        # 账号资料：昵称本身就是广告位（"看我简介"/"主页有群"）
         pv = check_account_profile(msg.full_name)
         if pv.hit:
-            await asyncio.to_thread(db.mark_checked, [msg.row_id])
-            await asyncio.to_thread(db.log_verdict, self.chat_id,
-                                    msg.message_id, msg.user_id, 1.0,
-                                    "local_rule", True, "账号资料")
-            return Verdict(msg, True, 1.0, "local_rule", pv.reason)
-            try:
-                await asyncio.to_thread(record_shadow_hits, msg.text, True)
-            except Exception:  # noqa: BLE001
-                pass
+            return await self._hit(msg, pv.reason)
 
-
-        # --- 自进化规则（已毕业的直拦）---
-        # 这些规则通过了"负样本零命中"闸门与 shadow 观察期，才有资格直拦。
+        # 自进化规则：通过"负样本零命中"闸门与 shadow 观察期后才允许直拦
         lv = check_learned_patterns(msg.text)
         if lv.hit:
-            await asyncio.to_thread(db.mark_checked, [msg.row_id])
-            return Verdict(msg, True, 1.0, "learned", lv.reason)
-            try:
-                await asyncio.to_thread(record_shadow_hits, msg.text, True)
-            except Exception:  # noqa: BLE001
-                pass
+            return await self._hit(msg, lv.reason, source="learned")
 
-
-        # --- inline 按钮检测 ---
-        # 广告号把广告做成按钮（"加入频道｜领取福利"），正文可以完全干净。
+        # inline 按钮：广告号把广告做成按钮，正文可以完全干净
         if msg.button_texts or msg.button_urls:
             bv = check_inline_buttons(msg.button_texts, msg.button_urls, managed)
             if bv.hit:
-                await asyncio.to_thread(db.mark_checked, [msg.row_id])
-                return Verdict(msg, True, 1.0, "local_rule", bv.reason)
+                return await self._hit(msg, bv.reason)
 
-        # --- 外部频道链接检测 ---
-        # 这些群有"集团"式频道体系，群友转发自家频道是常态。广告号借这个习惯
-        # 发**外部频道**的帖子：正文 Telegram 不下发（bot 只看到单字母），
-        # 但链接指向哪里是可见的。指向陌生目标即引流。
-        managed = await self._managed_links()
+        # 外部频道引流：这些群有"集团"式频道体系，群友转发自家频道是常态；
+        # 广告号借这个习惯发**外部频道**的帖子，链接指向陌生目标即引流。
         ev = check_external_channel_link(msg.text, managed)
         if ev.hit:
-            await asyncio.to_thread(db.mark_checked, [msg.row_id])
-            return Verdict(msg, True, 1.0, "local_rule", ev.reason)
+            return await self._hit(msg, ev.reason)
 
-        # --- 链接预览协同检测 ---
-        # 广告正文藏在下发不到的预览卡片里，但"多个账号指向同一预览目标"
-        # 是协同引流的确凿特征，且广告号绕不过去——它必须让群友看到广告。
+        # 协同引流：正文藏在下发不到的预览卡片里，但"多个账号指向同一
+        # 预览目标"是绕不过去的特征——广告号必须让群友看到广告。
         if msg.preview_fp:
             senders = await asyncio.to_thread(
                 db.record_preview, self.chat_id, msg.preview_fp,
                 msg.preview_url, msg.user_id)
             if senders >= PREVIEW_SENDER_THRESHOLD:
-                await asyncio.to_thread(db.mark_checked, [msg.row_id])
-                return Verdict(
-                    msg, True, 1.0, "local_rule",
-                    f"协同引流（{senders} 个账号指向同一预览目标）")
+                return await self._hit(
+                    msg, f"协同引流（{senders} 个账号指向同一预览目标）")
 
-        # --- 自适应检查强度（借鉴 StopSpam）---
-        # 长期干净发言的老群友不必每条都送 AI。但**这只是跳过 AI**：
-        # L0 确定性规则（联系方式/不可见字符/黑名单/裸字母/重复/外部频道/
-        # 按钮/自进化规则）已经在上面全部跑过，命中即删，与是否送 AI 无关。
-        #
-        # 保险措施：
-        #   · 任何触发条件命中 -> 送 AI，且强制走快车道
-        #   · 额度是计数的（30 条），刷满后下一条必送 AI 复核
-        #   · 只在 trust=trusted 时生效，新成员/有前科的每条都查
+        # 免 AI 额度（借鉴 StopSpam）：长期干净发言的老群友不必每条都送 AI。
+        # 但**只是跳过 AI**——上面所有 L0 规则已经跑过，命中即删，与此无关。
+        # 三道保险：触发条件命中即送 AI 并走快车道；额度计数制（30 条），
+        # 刷满后下一条必送 AI 复核；只对 trust=trusted 生效。
         flagged = stats["del_n"] > 0
         triggers = check_triggers(
             msg.text, trust, msg.has_preview,
@@ -381,7 +343,7 @@ class ChatPipeline:
             if left > 0:
                 await asyncio.to_thread(
                     db.consume_grace, self.chat_id, msg.user_id)
-                await asyncio.to_thread(db.mark_checked, [msg.row_id])
+                await self._skip(msg, "grace", "免AI额度")
                 msg.skipped_llm = True
                 logger.debug(
                     "免AI额度 chat=%s user=%s 剩余=%d text=%r",
@@ -489,10 +451,9 @@ class ChatPipeline:
         if not cfg:
             return
 
-        # 预算护栏。
-        # ⚠️ 早先的实现在这里直接 return，而这些消息**已经被标记 is_checked=1**
-        # 且不会重试 —— 等于永久静默丢失。实测线上有 2,370 条消息是这样被吞掉的，
-        # 其中混着真广告。现在改为：回队 + 告警（有重试上限兜底，不会无限堆积）。
+        # 预算护栏：超限必须**回队**而不是丢弃。
+        # 这些消息已被 take_unchecked_batch 标记 is_checked=1，
+        # 直接 return 等于永久静默丢失（线上曾这样吞掉 2,370 条，含真广告）。
         used = await asyncio.to_thread(db.tokens_used_today, self.chat_id)
         cap = int(cfg.get("daily_token_cap") or 0)
         # cap <= 0 表示不限量。测试期用它观察真实日消费，之后再定阈值。
@@ -734,7 +695,6 @@ class ChatPipeline:
         msgs.append({"role": "user", "content": BATCH_INSTRUCTION.format(
             count=len(batch), messages="\n".join(lines))})
         return msgs
-
 
 class PipelineManager:
     """所有群的流水线。一个群慢不会拖住其他群：每个群独立 asyncio 任务。"""

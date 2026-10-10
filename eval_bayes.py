@@ -20,7 +20,6 @@
 import asyncio
 import math
 import os
-import re
 import sqlite3
 import sys
 from collections import Counter

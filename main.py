@@ -18,7 +18,7 @@ import logging
 import os
 import sys
 import time
-from datetime import datetime, time as dtime, timedelta
+from datetime import time as dtime
 
 import pytz
 from dotenv import load_dotenv
@@ -42,13 +42,6 @@ from telegram.ext import (
 
 import db
 from deepseek import DeepSeekClient
-from detector_rules import (
-    check_inline_buttons,
-    compute_trust,
-    extract_tme_identifiers,
-    trust_marker,
-)
-
 
 def _extract_buttons(msg) -> tuple[list[str], list[str]]:
     """抽取消息的 inline 按钮文案与 URL。
@@ -71,7 +64,6 @@ def _extract_buttons(msg) -> tuple[list[str], list[str]]:
     return texts, urls
 from link_preview import has_link_preview, preview_fingerprint
 from pipeline import PendingMessage, PipelineManager, Verdict
-from prompts import NATURE_PRESETS
 
 load_dotenv()
 
@@ -114,10 +106,8 @@ _client: DeepSeekClient | None = None
 # 举报 ID -> 消息 row_id。判定完成后据此回填举报状态。
 _report_rows: dict[int, int] = {}
 
-
 def _is_admin_user(user_id: int | None) -> bool:
     return bool(ADMIN_ID) and user_id == ADMIN_ID
-
 
 async def _learn_managed_links(app: Application, chat_id: int) -> None:
     """学习本群体系的频道标识：群自己的 username + 群描述里的 @提及。
@@ -141,7 +131,6 @@ async def _learn_managed_links(app: Application, chat_id: int) -> None:
     logger.info("群体系频道 chat=%s username=%s linked=%s managed=%s",
                 chat_id, c.username, linked, hints)
 
-
 async def _refresh_admins(app: Application, chat_id: int) -> set[int]:
     """刷新并缓存群管理员。TTL 由 pipeline 侧各自控制。"""
     try:
@@ -153,11 +142,9 @@ async def _refresh_admins(app: Application, chat_id: int) -> set[int]:
         logger.warning("获取管理员失败 chat=%s: %s", chat_id, exc)
         return set()
 
-
 # 管理员缓存的 TTL。超时后台刷新，消息路径永不阻塞在 API 调用上。
 _ADMIN_TTL = 600.0
 _admin_cache: dict[int, tuple[float, set[int]]] = {}
-
 
 async def _is_cached_admin(chat_id: int, user_id: int) -> bool:
     now = time.time()
@@ -170,7 +157,6 @@ async def _is_cached_admin(chat_id: int, user_id: int) -> bool:
         return user_id in ids
     # 首次遇到该群：同步拉一次并落库
     return user_id in set()
-
 
 async def _send_admin(bot, text: str, **kw) -> bool:
     """发消息给管理员。
@@ -197,8 +183,6 @@ async def _send_admin(bot, text: str, **kw) -> bool:
         logger.warning("管理员通知发送失败: %s%s", msg, tail)
         return False
 
-
-
 # ---------------------------------------------------------------------------
 # 举报：群内 @机器人 / /report / 转发到私聊
 # ---------------------------------------------------------------------------
@@ -211,7 +195,6 @@ REPORT_LIMIT_DEFAULT = 20
 # 举报人历史准确率低于此值且样本足够时，降级为"仅记录不处理"
 REPORTER_MIN_ACCURACY = 0.20
 REPORTER_MIN_SAMPLES = 8
-
 
 async def _pick_report_chat(update: Update, forwarded_user_id: int) -> tuple[int, str]:
     """判断这条举报属于哪个群。返回 (chat_id, 来源说明)。
@@ -239,7 +222,6 @@ async def _pick_report_chat(update: Update, forwarded_user_id: int) -> tuple[int
     if len(chats) == 1:
         return chats[0]["chat_id"], "转发"
     return 0, ""
-
 
 async def _handle_forwarded_report(update: Update,
                                    context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -352,7 +334,6 @@ async def _handle_forwarded_report(update: Update,
         + ("" if target_id else "\n⚠️ 未能识别被举报人 ID，只能记录内容。")
     )
 
-
 # ---------------------------------------------------------------------------
 # 记录频道
 # ---------------------------------------------------------------------------
@@ -406,8 +387,6 @@ def _make_on_log(app: Application):
                                row["log_channel_id"], exc)
     return on_log
 
-
-
 # ---------------------------------------------------------------------------
 # 删除执行
 # ---------------------------------------------------------------------------
@@ -416,13 +395,11 @@ async def _delete_verdict(bot, v: Verdict) -> None:
     await bot.delete_message(chat_id=v.message.chat_id,
                              message_id=v.message.message_id)
 
-
 # 同一账号在本群被删多少次后推入全局黑名单（跨群生效）。
 # 实测依据：同一批广告号同时打多个群（南京苏州集团与武汉集团同期出现同一套
 # "招募探花"广告）。A 群确认过的号在 B 群当场生效，不必各自重新踩一遍——
 # 群越多，每个群越安全。
 GLOBAL_BLACKLIST_AFTER = 5
-
 
 async def _maybe_global_blacklist(bot, chat_id: int, user_id: int,
                                   full_name: str | None, reason: str) -> None:
@@ -451,7 +428,6 @@ async def _maybe_global_blacklist(bot, chat_id: int, user_id: int,
     except Exception as exc:  # noqa: BLE001
         logger.warning("全局黑名单写入失败 user=%s: %s", user_id, exc)
 
-
 def _spam_keyboard(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("↩️ 误删，恢复并加白",
@@ -459,14 +435,12 @@ def _spam_keyboard(chat_id: int, user_id: int) -> InlineKeyboardMarkup:
         InlineKeyboardButton("🚫 拉黑此人", callback_data=f"bl_{chat_id}_{user_id}"),
     ]])
 
-
 # 一批删除过多时，逐条通知会把私聊刷爆，只对前 N 条发逐条通知，
 # 其余合并成一条摘要。摘要里的条目仍可用 /recent 逐个处理。
 MAX_DETAIL_NOTIFY = 6
 
 # 每次抽样复核推送几条
 SAMPLE_REVIEW_COUNT = 5
-
 
 async def _notify_spam(bot, verdicts: list[Verdict], shadow: bool) -> None:
     """逐条通知管理员，每条带自己的操作按钮。
@@ -520,7 +494,6 @@ async def _notify_spam(bot, verdicts: list[Verdict], shadow: bool) -> None:
         lines.append("\n用 /recent 查看并逐条恢复。")
         await _send_admin(bot, "\n".join(lines), disable_web_page_preview=True)
 
-
 def _latest_record_id(chat_id: int, message_id: int) -> int | None:
     """取某条消息最近一次删除记录的 ID。"""
     row = db.query_one("""SELECT id FROM spam_records
@@ -528,13 +501,11 @@ def _latest_record_id(chat_id: int, message_id: int) -> int | None:
                           ORDER BY id DESC LIMIT 1""", (chat_id, message_id))
     return row["id"] if row else None
 
-
 # 自动注册时使用的默认值。
 # 阈值 0.50 是离线实测 F1 最优档（召回 95.5% / 精确 89.3%）。
 # 群性质默认 general（最保守的表征），群主确认后可改。
 AUTO_REGISTER_CUT = 0.50
 AUTO_REGISTER_NATURE = "general"
-
 
 async def _auto_register(app: Application, chat, added_by: int | None) -> bool:
     """机器人被拉进群时自动注册并通知管理员。
@@ -577,7 +548,6 @@ async def _auto_register(app: Application, chat, added_by: int | None) -> bool:
             logger.warning("自动注册通知失败: %s", exc)
     return True
 
-
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """机器人自身的成员状态变化：被拉进群 / 被提升为管理员 / 被踢出。"""
     cm = update.my_chat_member
@@ -602,8 +572,6 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     if new_status == "administrator":
         await _refresh_admins(context.application, chat.id)
 
-
-
 # ---------------------------------------------------------------------------
 # 消息处理
 # ---------------------------------------------------------------------------
@@ -616,9 +584,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     chat = update.effective_chat
 
     # ── 本群绑定频道的自动转发：最早放行 ────────────────────────────
-    # 放在所有守卫之前，因为 Telegram 对频道来源的消息可能**不下发 from_user**，
-    # 那样会在下面的 effective_user 守卫处被静默丢弃，根本走不到判定逻辑。
-    # 必须先识别出"这是本群自己的频道内容"再谈其他。
+    # 必须在所有守卫之前：Telegram 对频道来源的消息可能不下发 from_user，
+    # 那样会在下面的守卫处被静默丢弃，根本走不到判定逻辑。
+    # 只放行**本群自己的绑定频道**，外部频道的自动转发照常判定。
     if getattr(msg, "is_automatic_forward", False) and chat.type in (
             "group", "supergroup"):
         try:
@@ -650,10 +618,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
 
     # ── 编辑消息：必须重新判定 ──────────────────────────────────────
-    # 经典规避手法（The Edit Trick）：先发一条正常消息，过一段时间再编辑成
-    # 广告/诈骗链接。绝大多数机器人只在消息到达时检查一次，编辑后就不再管。
-    # Telegram 会把编辑作为 edited_message 推过来，这里的处理是把消息
-    # 重新置为未检测并复用正常流程。
+    # 经典规避手法 The Edit Trick：先发正常消息，过一段时间再编辑成广告。
+    # 绝大多数机器人只在到达时检查一次。这里把消息重新置为未检测，
+    # 复用正常判定流程。
     if update.edited_message is not None:
         await _handle_edited(update, context, chat.id, user, msg)
         return
@@ -765,7 +732,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if verdict and verdict.is_spam:
         await _apply_verdict(context.application, verdict)
 
-
 async def _handle_edited(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          chat_id: int, user, msg) -> None:
     """处理消息被编辑的情况。
@@ -815,8 +781,6 @@ async def _handle_edited(update: Update, context: ContextTypes.DEFAULT_TYPE,
     async with pipeline._lock:  # noqa: SLF001
         pipeline._fast.appendleft(pending)  # noqa: SLF001
 
-
-
 async def _handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE,
                          chat_id: int, reporter, text: str) -> None:
     """群友回复广告消息并 @机器人。"""
@@ -857,7 +821,6 @@ async def _handle_report(update: Update, context: ContextTypes.DEFAULT_TYPE,
     async with pipeline._lock:  # noqa: SLF001 - 有意插队
         pipeline._fast.appendleft(pending)  # noqa: SLF001
 
-
 def _make_on_spam(app: Application):
     async def on_spam(v: Verdict) -> None:
         await _delete_verdict(app.bot, v)
@@ -869,7 +832,6 @@ def _make_on_spam(app: Application):
                                       f"AI判定 {v.confidence:.2f}")
     return on_spam
 
-
 def _make_notify(app: Application):
     async def notify(verdicts: list[Verdict]) -> None:
         chat_id = verdicts[0].message.chat_id if verdicts else 0
@@ -878,7 +840,6 @@ def _make_notify(app: Application):
         if row and row["notify_admin"]:
             await _notify_spam(app.bot, verdicts, shadow)
     return notify
-
 
 async def _apply_verdict(app: Application, v: Verdict) -> None:
     """执行一条 L0 判定（立即删除）。"""
@@ -906,7 +867,6 @@ async def _apply_verdict(app: Application, v: Verdict) -> None:
             logger.warning("L0 删除失败 msg=%s: %s", v.message.message_id, exc)
     if row and row["notify_admin"]:
         await _notify_spam(app.bot, [v], shadow)
-
 
 # ---------------------------------------------------------------------------
 # 命令
@@ -941,7 +901,6 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "必须授予「删除消息」权限，否则无法清理他人消息。"
         )
 
-
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin_user(update.effective_user.id if update.effective_user else None):
         return
@@ -949,7 +908,6 @@ async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(
             "🛡️ 反广告管理面板", reply_markup=_admin_kb()
         )
-
 
 def _admin_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -960,7 +918,6 @@ def _admin_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("📨 举报统计", callback_data="adm_reports"),
          InlineKeyboardButton("📜 判定记录", callback_data="adm_recent")],
     ])
-
 
 async def cmd_wl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """白名单管理。用法：回复某人 + /wl [advertiser]，或 /wl remove。"""
@@ -1015,7 +972,6 @@ async def cmd_wl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     desc = "仅删高置信广告（付费商家）" if level == "advertiser" else "完全跳过检测"
     await msg.reply_text(f"✅ {target.full_name} 已加入白名单\n档位：{level}（{desc}）")
 
-
 async def cmd_bl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """黑名单：不看内容直接删除。用法：回复某人 + /bl，或 /bl remove。"""
     if not _is_admin_user(update.effective_user.id if update.effective_user else None):
@@ -1047,7 +1003,6 @@ async def cmd_bl(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                             update.effective_user.id, "管理员拉黑")
     await msg.reply_text(f"🚫 {t.full_name} 已拉黑，其消息将被直接删除。")
 
-
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """举报。也可用「回复消息 + @机器人」。"""
     msg = update.effective_message
@@ -1056,7 +1011,6 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     await _handle_report(update, context, update.effective_chat.id,
                         update.effective_user, "report")
-
 
 async def cmd_logchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """设置/取消删除记录频道。
@@ -1114,7 +1068,6 @@ async def cmd_logchannel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await asyncio.to_thread(db.set_log_channel, c["chat_id"], cid)
     await msg.reply_text(f"✅ 已把 {len(chats)} 个群的删除记录指向频道 {cid}")
 
-
 async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """列出最近删除记录，每条带独立恢复按钮。
 
@@ -1155,7 +1108,6 @@ async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         text = text[:3800] + "\n…（已截断，用 /recent <数量> 调整）"
     await msg.reply_text(text, reply_markup=InlineKeyboardMarkup(kb_rows),
                          disable_web_page_preview=True)
-
 
 async def cmd_revive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """按记录 ID 恢复。/revive 123
@@ -1203,7 +1155,6 @@ async def cmd_revive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"该内容已记为反例。消息本身无法找回。"
     )
 
-
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not _is_admin_user(update.effective_user.id if update.effective_user else None):
         return
@@ -1220,7 +1171,6 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"缓存{usage['cache_hit_rate']:.0%} ¥{usage['cost_yuan']:.4f}"
         )
     await update.message.reply_text("\n".join(lines))
-
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -1362,7 +1312,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             f"🚫 {rec['full_name'] or rec['user_id']} 已拉黑，其消息将被直接删除。\n"
             f"（该内容已记入判定记忆，其他账号再发将直接删除）")
 
-
 # ---------------------------------------------------------------------------
 # 定时任务
 # ---------------------------------------------------------------------------
@@ -1371,13 +1320,11 @@ async def job_keepalive(context: ContextTypes.DEFAULT_TYPE) -> None:
     with open(HEARTBEAT_FILE, "w") as f:
         f.write(str(time.time()))
 
-
 async def job_cleanup(context: ContextTypes.DEFAULT_TYPE) -> None:
     """按时间硬删过期消息。V1 只删"已总结"的，导致积压 114 天。"""
     n = await asyncio.to_thread(db.purge_old_messages, MESSAGE_RETENTION_DAYS)
     if n:
         logger.info("清理过期消息 %d 条（保留 %d 天）", n, MESSAGE_RETENTION_DAYS)
-
 
 async def job_report_board(context: ContextTypes.DEFAULT_TYPE) -> None:
     """每日举报榜。门槛按群配置（V1 硬编码 50%）。"""
@@ -1400,7 +1347,6 @@ async def job_report_board(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("发送举报榜失败 chat=%s: %s", cid, exc)
 
-
 async def job_refresh_admins(context: ContextTypes.DEFAULT_TYPE) -> None:
     """定期刷新管理员列表与群体系频道。
 
@@ -1411,7 +1357,6 @@ async def job_refresh_admins(context: ContextTypes.DEFAULT_TYPE) -> None:
         cid = r["chat_id"]
         await _refresh_admins(context.application, cid)
         await _learn_managed_links(context.application, cid)
-
 
 async def job_sample_review(context: ContextTypes.DEFAULT_TYPE) -> None:
     """抽样复核：每天推几条删除记录给管理员确认。
@@ -1443,7 +1388,6 @@ async def job_sample_review(context: ContextTypes.DEFAULT_TYPE) -> None:
     lines += ["", "为什么做这个：实测 1844 次删除只被复核过 1 次，",
               "反馈回路没闭合的话，判定质量就是不可测的。"]
     await _send_admin(context.bot, "\n".join(lines))
-
 
 async def job_self_evolve(context: ContextTypes.DEFAULT_TYPE) -> None:
     """自进化：挖候选规则 + 检查毕业。
@@ -1489,7 +1433,6 @@ async def job_self_evolve(context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("查看：manage.py learn <chat_id>")
         await _send_admin(context.bot, "\n".join(lines))
 
-
 async def job_backfill(context: ContextTypes.DEFAULT_TYPE) -> None:
     """定时回捞未检测消息。
 
@@ -1509,7 +1452,6 @@ async def job_backfill(context: ContextTypes.DEFAULT_TYPE) -> None:
     if total:
         logger.info("回捞补判：共 %d 条未检测消息入队", total)
 
-
 async def job_heartbeat_check(context: ContextTypes.DEFAULT_TYPE) -> None:
     """自检：判定连续失败时告警，避免静默失效。"""
     if not ADMIN_ID or not _manager:
@@ -1519,7 +1461,6 @@ async def job_heartbeat_check(context: ContextTypes.DEFAULT_TYPE) -> None:
             await _send_admin(context.bot,
                               f"⚠️ 群 {cid} 判定异常：{p.last_error}")
             p.last_error = None
-
 
 # ---------------------------------------------------------------------------
 # 启动
@@ -1558,14 +1499,12 @@ async def post_init(app: Application) -> None:
          f"把机器人拉进群即可自动注册，无需手动操作。"),
     )
 
-
 async def post_shutdown(app: Application) -> None:
     if _manager:
         await _manager.stop()
     if _client:
         await _client.close()
     logger.info("已下线")
-
 
 async def preflight() -> int:
     """启动前自检：验证 token、模型、数据库、权限，不进入轮询。
@@ -1662,7 +1601,6 @@ async def preflight() -> int:
     print("=" * 60)
     return 0 if ok else 1
 
-
 def main() -> None:
     if "--check" in sys.argv:
         sys.exit(asyncio.run(preflight()))
@@ -1709,13 +1647,10 @@ def main() -> None:
     app.add_handler(CommandHandler("recent", cmd_recent))
     app.add_handler(CommandHandler("revive", cmd_revive))
     app.add_handler(CallbackQueryHandler(on_callback))
-    # 一个 handler 同时覆盖新消息与编辑消息：
-    # filters.check_update 基于 Update.effective_message，而 effective_message
-    # 在 message 为空时会取 edited_message，所以编辑消息也会进到这里。
-    # handle_message 里用 update.edited_message 区分两条路径。
-    #
-    # 注意：add_handler 默认都在 group 0，而一个 group 内只有**第一个匹配的**
-    # handler 会被调用。所以这里注册两次是无效的（第二次永远不会执行）。
+    # 一个 handler 同时覆盖新消息与编辑消息：filters.check_update 基于
+    # Update.effective_message，而它在 message 为空时会取 edited_message。
+    # 注意 add_handler 默认都在 group 0，同 group 内只有**第一个匹配的**
+    # handler 会执行——所以这里注册两次是无效的。
     app.add_handler(MessageHandler(
         (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, handle_message))
 
@@ -1738,7 +1673,6 @@ def main() -> None:
 
     logger.info("启动轮询…")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-
 
 if __name__ == "__main__":
     main()

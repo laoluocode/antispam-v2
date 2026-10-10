@@ -285,11 +285,9 @@ def mine_phrases(spam: list[str], ham: list[str]) -> list[Candidate]:
             continue
         survived.append((gram, n))
 
-    # 子串剪枝：`洗m1挣`、`来洗m1挣`、`来洗m1挣一` 都是同一条文案的子串，
-    # 全部保留会让规则数爆炸且毫无额外覆盖。只留极大片段——
-    # 即不被任何**命中次数不少于自己**的更长片段包含。
-    #
-    # 注意不能跨命中数剪枝：命中 10 次的短片段可能比命中 5 次的长片段更有价值。
+    # 子串剪枝：同一条文案会产生大量互为子串的片段，全部保留会让规则数爆炸
+    # 且毫无额外覆盖。只留极大片段——不被任何**命中数不少于自己**的更长片段包含。
+    # 不能跨命中数剪枝：命中 10 次的短片段可能比命中 5 次的长片段更有价值。
     survived.sort(key=len, reverse=True)
     out = []
     for gram, n in survived:
@@ -339,12 +337,9 @@ def mine_all(spam: list[str], ham: list[str]) -> list[Candidate]:
         if cur is None or c.spam_hits > cur.spam_hits:
             best[c.pattern] = c
 
-    # 跨类型子串剪枝。
-    # 各类型内部的剪枝不够：`无押小额口苓红包洗资` 会作为 signature 存活，
-    # 而 phrase 类里它的子串 `无押小额口苓红` 因为"有更长且命中不少于自己的
-    # 片段"被剪掉——两边一合并，短的反而活了下来，长的也在，形成冗余。
-    # 这里跨类型再剪一次：短片段若被某条命中量不少于自己的更长片段包含，
-    # 就丢弃。域名类不参与（t.me/wdgx 是独立标识，不该被长文本包含）。
+    # 跨类型子串剪枝：各类型内部剪枝不够。长片段作为 signature 存活，
+    # 而其子串在 phrase 类里因"有更长片段"被剪掉时，两边一合并短的反而活下来，
+    # 形成冗余。这里跨类型再剪一次。域名类不参与（t.me/xxx 是独立标识）。
     items = sorted(best.values(),
                    key=lambda c: (len(c.pattern), -c.spam_hits), reverse=True)
     kept: list[Candidate] = []
@@ -378,11 +373,9 @@ def refresh_candidates(chat_id: int) -> dict:
         return {"skipped": True, "reason": "语料不足",
                 "spam": len(spam), "ham": len(ham)}
 
-    # 正常语料饥饿保护。
-    # 借鉴 @BayesSpamSniperBot 上线故障的教训：他的训练集里广告远多于正常消息，
-    # 分类器学成"倾向判广告"，上线后大规模误删。
-    # 我们的闸门完全依赖正常语料——正常样本太少时"零命中"就失去了统计意义，
-    # 所以宁可不学，也不能在证据不足时放权。
+    # 正常语料饥饿保护：闸门完全依赖正常语料，样本太少时"零命中"失去统计意义。
+    # 借鉴 @BayesSpamSniperBot 的上线故障（训练集广告远多于正常消息，
+    # 分类器学成"倾向判广告"，上线后大规模误删）。宁可不学，也不在证据不足时放权。
     ratio = len(ham) / max(1, len(spam))
     if ratio < MIN_HAM_PER_SPAM:
         logger.warning(

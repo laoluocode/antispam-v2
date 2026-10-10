@@ -26,7 +26,7 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)

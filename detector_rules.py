@@ -370,12 +370,10 @@ def load_patterns(force: bool = False) -> list:
     now = time.time()
     if not force and now - _pattern_cache_at < PATTERN_CACHE_TTL:
         return _pattern_cache
-    # 直接 import db，不要写 "try: from database ... except ImportError" 那种回退。
-    #
-    # 那是个极隐蔽的坑：`database` 是**老 bot 的模块**（另一个 schema），
-    # 在容器里它 import 是**成功**的（不触发 ImportError），于是拿它去查
-    # spam_patterns 表必然失败——而 except 把错误吞掉了，静默返回空缓存。
-    # 结果：自进化规则**从上线起就没被加载过**，66 条规则全是摆设。
+    # 直接 import db，不要写 "try: from database ... except ImportError" 的回退：
+    # `database` 是老 bot 的模块（另一个 schema），在容器里 import 会**成功**
+    # （不触发 ImportError），于是拿它查 spam_patterns 必然失败并被 except 吞掉，
+    # 静默返回空缓存——自进化规则曾因此从上线起就没被加载过。
     try:
         import db as _db
     except ImportError:
