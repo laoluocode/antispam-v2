@@ -253,6 +253,33 @@ CREATE TABLE IF NOT EXISTS global_blacklist (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 判定记忆：管理员裁决过的内容，同类再来直接复用结论。
+--
+-- 来源（AstrBot QQ 群广告拦截插件的设计）：
+--   "疑似广告自动发给群管理员人工确认；**确认结果记录进学习库，
+--    后续相同内容直接复用结论**"
+--
+-- 这解决了一个重复劳动问题：同一条广告被 ABC 三个账号发三遍，
+-- LLM 要判三次、管理员要看三次。人工裁决一次之后就该自动处理。
+--
+-- 两种记忆：
+--   false_positive（管理员说误删）-> 同类内容永不删（保护真人）
+--   confirmed（管理员确认是广告）-> 同类内容直接删（0ms，且抗变体）
+CREATE TABLE IF NOT EXISTS verdict_memory (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    norm_hash   TEXT NOT NULL,             -- 归一化后的内容哈希
+    sample      TEXT,                      -- 原文样本，供人工复核
+    label       TEXT NOT NULL,             -- false_positive | confirmed
+    source      TEXT,                      -- admin_revive | admin_report | auto
+    hits        INTEGER DEFAULT 0,         -- 复用次数
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_verdict_memory
+    ON verdict_memory(chat_id, norm_hash, label);
+CREATE INDEX IF NOT EXISTS idx_verdict_memory_hash
+    ON verdict_memory(norm_hash);
+
 -- 全部判定记录（含"判定为正常"的）。
 --
 -- 为什么不能只用 spam_records 做分布分析：那张表只记删除/观察/恢复，
@@ -365,7 +392,7 @@ REQUIRED_TABLES = (
     "chat_settings", "spam_whitelist", "spam_blacklist", "spam_patterns",
     "chat_fewshots", "spam_reports", "daily_report_stats", "token_usage",
     "report_usage", "dropped_messages", "preview_fingerprints",
-    "preview_senders", "global_blacklist", "verdict_log",
+    "preview_senders", "global_blacklist", "verdict_log", "verdict_memory",
 )
 
 
@@ -851,6 +878,19 @@ def get_spam_record(record_id: int):
     return query_one("SELECT * FROM spam_records WHERE id=?", (record_id,))
 
 
+def normalize_for_hash(text: str) -> str:
+    """归一化后取哈希键。
+
+    用归一化文本而不是原文：同一句广告的谐音/不可见字符变体应当命中
+    同一条记忆，否则广告号改一个字符就绕过了人工裁决。
+    """
+    try:
+        from utils.normalize import normalize
+        return normalize(text or "")
+    except Exception:  # noqa: BLE001
+        return (text or "").strip().lower()
+
+
 def log_verdict(chat_id: int, message_id: int, user_id: int,
                 confidence: float | None, source: str, deleted: bool,
                 triggers: str = "") -> None:
@@ -872,6 +912,55 @@ def prune_verdict_log(days: int = 30) -> int:
         cur = conn.execute("DELETE FROM verdict_log WHERE created_at < datetime('now', ?)",
                            (f"-{days} days",))
         return cur.rowcount
+
+
+def remember_verdict(chat_id: int, text: str, label: str,
+                     source: str = "admin") -> bool:
+    """记住一条人工裁决，供后续同类内容复用。
+
+    label: false_positive（误删，以后别删）| confirmed（确认是广告，以后直接删）
+    """
+    norm = normalize_for_hash(text)
+    if len(norm) < 3:
+        return False
+    try:
+        execute("""INSERT INTO verdict_memory
+            (chat_id, norm_hash, sample, label, source)
+            VALUES (?,?,?,?,?)
+            ON CONFLICT(chat_id, norm_hash, label)
+            DO UPDATE SET hits = hits""",
+            (chat_id, norm, (text or "")[:200], label, source))
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("写入判定记忆失败 chat=%s label=%s: %s", chat_id, label, exc)
+        return False
+
+
+def recall_verdict(chat_id: int, text: str) -> str | None:
+    """查这条内容有没有被人工裁决过。返回 label 或 None。
+
+    这是"人工裁决一次、后续自动复用"的入口——既省 LLM 调用，
+    也保证同一条内容不会因为模型随机性而被反复改判。
+    """
+    norm = normalize_for_hash(text)
+    if len(norm) < 3:
+        return None
+    row = query_one("""SELECT label FROM verdict_memory
+                       WHERE chat_id=? AND norm_hash=?
+                       ORDER BY CASE label WHEN 'false_positive' THEN 0 ELSE 1 END
+                       LIMIT 1""", (chat_id, norm))
+    if row is None:
+        return None
+    execute("UPDATE verdict_memory SET hits = hits + 1 "
+            "WHERE chat_id=? AND norm_hash=?", (chat_id, norm))
+    return row["label"]
+
+
+def verdict_memory_list(chat_id: int = 0, limit: int = 50) -> list[sqlite3.Row]:
+    if chat_id:
+        return query("""SELECT * FROM verdict_memory WHERE chat_id=?
+                        ORDER BY id DESC LIMIT ?""", (chat_id, limit))
+    return query("SELECT * FROM verdict_memory ORDER BY id DESC LIMIT ?", (limit,))
 
 
 def verdict_health(chat_id: int = 0, hours: int = 24) -> dict:

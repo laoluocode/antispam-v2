@@ -968,6 +968,63 @@ async def main():
           % mR.fast)
     assert mR.fast, "波次期间所有消息应走快车道"
 
+    print("=== 26. 回归：判定记忆（人工裁决一次，后续自动复用）===")
+    # 来源（AstrBot QQ 群广告拦截插件）："疑似广告自动发给群管理员人工确认；
+    # **确认结果记录进学习库，后续相同内容直接复用结论**"。
+    # 解决的问题：同一条广告被 ABC 三个账号发三遍，原本要判三次、
+    # 管理员要看三次。人工裁决一次之后就该校自动处理。
+    cidM = -995
+    db.register_chat(cidM, "记忆测试群", "general", shadow_mode=False)
+    db.set_chat_field(cidM, "shadow_mode", 0)
+
+    # (a) 误删记忆 -> 同类内容直接放行，不再送 AI
+    txt = "今天在汉口修的车体验还行"
+    assert db.recall_verdict(cidM, txt) is None, "初始不应有记忆"
+    db.remember_verdict(cidM, txt, "false_positive", "admin_revive")
+    got = db.recall_verdict(cidM, txt)
+    print("  (a) 误删记忆: %r -> 复用结论=%s（应 false_positive）" % (txt[:20], got))
+    assert got == "false_positive"
+
+    rid = db.save_message(cidM, 9800, 41, "真人", txt, None, "t")
+    pM = ChatPipeline(cidM, Graded({}), noop, None)
+    v = await pM.submit(PendingMessage(rid, 9800, cidM, 41, "真人", txt, None, "t"))
+    print("      同类内容判定结果=%s 入队=%d（应 None/0，直接放行）"
+          % (v, len(pM._fast) + len(pM._slow)))
+    assert v is None and not pM._fast and not pM._slow, "误删记忆应直接放行"
+
+    # (b) 确认记忆 -> 同类内容直接删
+    ad = "充电宝投放日入过w的新项目"
+    db.remember_verdict(cidM, ad, "confirmed", "admin_report")
+    rid = db.save_message(cidM, 9801, 42, "广告号", ad, None, "t")
+    pM2 = ChatPipeline(cidM, Graded({}), noop, None)
+    v = await pM2.submit(PendingMessage(rid, 9801, cidM, 42, "广告号", ad, None, "t"))
+    print("  (b) 确认记忆: %r -> 判定=%s reason=%s"
+          % (ad[:20], "删除" if (v and v.is_spam) else "放过",
+             v.reason if v else ""))
+    assert v and v.is_spam, "确认记忆应直接删除"
+    assert v.source == "memory"
+
+    # (c) 关键：谐音/不可见字符变体也要命中同一记忆
+    # 否则广告号改一个字符就绕过了人工裁决
+    variant = "充电宝投放\u200b日入过w的新项目"      # 插入零宽空格
+    got_v = db.recall_verdict(cidM, variant)
+    print("  (c) 变体（插入零宽空格）: 复用结论=%s（应命中，否则改一字符即可绕过）"
+          % got_v)
+    assert got_v == "confirmed", "归一化变体必须命中同一记忆"
+
+    # (d) 误删优先于确认（同一内容两种记忆时保护真人）
+    db.remember_verdict(cidM, txt, "confirmed", "x")
+    got_p = db.recall_verdict(cidM, txt)
+    print("  (d) 同时存在两种记忆时取=%s（应 false_positive，优先保护真人）" % got_p)
+    assert got_p == "false_positive", "误删记忆应优先"
+
+    # (e) 太短的内容不记忆（避免把 'ok' 这类记成永久规则）
+    print("  (e) 过短内容是否记忆: %s（应 False）"
+          % db.remember_verdict(cidM, "ok", "confirmed"))
+    assert not db.remember_verdict(cidM, "ok", "confirmed")
+
+    print("  记忆条数=%d" % len(db.verdict_memory_list(cidM)))
+
     os.unlink(tmp)
     print("\n全部通过")
 

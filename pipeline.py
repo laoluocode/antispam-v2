@@ -266,6 +266,28 @@ class ChatPipeline:
                                     "local_rule", True, ",".join(msg.triggers))
             return Verdict(msg, True, 1.0, "local_rule", v.reason)
 
+        # --- 判定记忆（人工裁决过的内容直接复用结论）---
+        # 同一条广告被 ABC 三个账号发三遍，不该判三次、也不该让管理员看三次。
+        # 人工裁决一次之后，同类内容（含谐音/不可见字符变体，因为用了归一化哈希）
+        # 直接按已裁结论处理。
+        #   false_positive -> 放行（保护真人）
+        #   confirmed      -> 直删（0ms）
+        memo = await asyncio.to_thread(db.recall_verdict, self.chat_id, msg.text)
+        if memo == "false_positive":
+            await asyncio.to_thread(db.mark_checked, [msg.row_id])
+            await asyncio.to_thread(db.log_verdict, self.chat_id,
+                                    msg.message_id, msg.user_id, 0.0,
+                                    "memory", False, "人工判为误删")
+            logger.info("判定记忆放行 chat=%s msg=%s", self.chat_id,
+                        msg.message_id)
+            return None
+        if memo == "confirmed":
+            await asyncio.to_thread(db.mark_checked, [msg.row_id])
+            await asyncio.to_thread(db.log_verdict, self.chat_id,
+                                    msg.message_id, msg.user_id, 1.0,
+                                    "memory", True, "人工确认为广告")
+            return Verdict(msg, True, 1.0, "memory", "人工确认为广告")
+
         # --- 账号资料检测（昵称即广告位）---
         # 放在内容规则之后：内容规则更确定（联系方式本体不会误伤），
         # 资料规则的覆盖更广但依赖昵称习惯。

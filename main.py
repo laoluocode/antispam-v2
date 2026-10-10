@@ -1180,6 +1180,12 @@ async def cmd_revive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if rec["text_snapshot"]:
         await asyncio.to_thread(db.add_fewshot, rec["chat_id"], "negative",
                                 rec["text_snapshot"], "revive")
+        # 判定记忆：比 few-shot 更硬——同类内容（含归一化后的谐音/不可见字符
+        # 变体）今后**直接放行，不再送 AI**。这是"人工裁决一次、后续自动复用"
+        # 的关键，避免同一条内容被反复判、反复让管理员看。
+        await asyncio.to_thread(db.remember_verdict, rec["chat_id"],
+                                rec["text_snapshot"], "false_positive",
+                                "admin_revive")
     await asyncio.to_thread(db.execute,
                             "UPDATE spam_records SET action='revive' WHERE id=?",
                             (rec_id,))
@@ -1311,6 +1317,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if rec["text_snapshot"]:
             await asyncio.to_thread(db.add_fewshot, cid, "negative",
                                     rec["text_snapshot"], "revive")
+            # 判定记忆：同类内容今后直接放行，不再送 AI 也不再打扰管理员
+            await asyncio.to_thread(db.remember_verdict, cid,
+                                    rec["text_snapshot"], "false_positive",
+                                    "admin_revive")
         # 2) 把该条记录标记为已恢复
         await asyncio.to_thread(db.execute,
                                 "UPDATE spam_records SET action='revive' WHERE id=?",
@@ -1339,8 +1349,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await asyncio.to_thread(db.blacklist_add, rec["chat_id"],
                                 rec["user_id"], rec["full_name"],
                                 query.from_user.id, "管理员从通知拉黑")
+        # 拉黑 = 管理员确认这是广告。把内容写进判定记忆，
+        # 这样其他账号再发同一内容时 0ms 直接删，不必等 LLM。
+        if rec["text_snapshot"]:
+            await asyncio.to_thread(db.remember_verdict, rec["chat_id"],
+                                    rec["text_snapshot"], "confirmed",
+                                    "admin_report")
         await query.edit_message_text(
-            f"🚫 {rec['full_name'] or rec['user_id']} 已拉黑，其消息将被直接删除。")
+            f"🚫 {rec['full_name'] or rec['user_id']} 已拉黑，其消息将被直接删除。\n"
+            f"（该内容已记入判定记忆，其他账号再发将直接删除）")
 
 
 # ---------------------------------------------------------------------------

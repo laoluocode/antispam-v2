@@ -134,6 +134,45 @@ def cmd_words(args) -> None:
         print("  manage.py words -100xxx          # 只看当前词表")
 
 
+def cmd_memory(args) -> None:
+    """判定记忆：管理员裁决过的内容，同类再来直接复用结论。
+
+    来源（AstrBot QQ 群广告拦截插件的设计）："疑似广告发给群管理员人工确认；
+    **确认结果记录进学习库，后续相同内容直接复用结论**"。
+
+    这解决一个重复劳动问题：同一条广告被 ABC 三个账号发三遍，
+    原本要判三次、管理员要看三次。人工裁决一次之后就该自动处理。
+
+    用**归一化哈希**做键，所以谐音/不可见字符变体也会命中同一记忆——
+    广告号改一个字符绕不过人工裁决。
+    """
+    if args.forget:
+        with db.tx() as conn:
+            n = conn.execute("DELETE FROM verdict_memory WHERE norm_hash=?",
+                             (db.normalize_for_hash(args.forget),)).rowcount
+        print("已删除 %d 条记忆" % n)
+        return
+
+    rows = db.verdict_memory_list(args.chat_id, args.limit)
+    if not rows:
+        print("判定记忆为空。")
+        print("（管理员用「↩️ 误删恢复」或「🚫 拉黑」后会写入）")
+        return
+    print("判定记忆（%d 条）:" % len(rows))
+    print("  %-14s %-52s %6s" % ("类型", "内容样本", "复用"))
+    print("  " + "-" * 76)
+    for r in rows:
+        kind = ("误删(放行)" if r["label"] == "false_positive"
+                else "确认(直删)")
+        print("  %-14s %-52s %6d"
+              % (kind, str(r["sample"] or "")[:50], r["hits"] or 0))
+    fp = sum(1 for r in rows if r["label"] == "false_positive")
+    cf = len(rows) - fp
+    print()
+    print("  误删记忆 %d 条（保护真人） / 确认记忆 %d 条（省 LLM）" % (fp, cf))
+    print("  用法：manage.py memory [chat_id] [--forget <内容>] [--limit N]")
+
+
 def cmd_health(args) -> None:
     """判定健康度：观察阈值漂移、语料倾斜、人工推翻率。
 
@@ -492,6 +531,12 @@ def main() -> None:
 
     c = sub.add_parser("list", help="列出所有群")
     c.set_defaults(func=cmd_list)
+
+    m2 = sub.add_parser("memory", help="判定记忆（人工裁决复用）")
+    m2.add_argument("chat_id", nargs="?", type=int, default=0)
+    m2.add_argument("--forget", help="按内容删除一条记忆")
+    m2.add_argument("--limit", type=int, default=50)
+    m2.set_defaults(func=cmd_memory)
 
     k = sub.add_parser("health", help="判定健康度（阈值漂移/语料倾斜/推翻率）")
     k.add_argument("chat_id", nargs="?", type=int, default=0)
