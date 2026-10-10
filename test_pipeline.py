@@ -521,6 +521,120 @@ async def main():
     print("  正常语料误伤: %s (应为空)" % fp)
     assert not fp, "自进化规则不该命中正常语料"
 
+    print("=== 18. 回归：自适应检查强度（免 AI 额度）===")
+    from detector_rules import check_triggers
+
+    # 触发条件单测
+    cases = [
+        ("今天天气不错", "trusted", False, False, False, [], "老群友闲聊"),
+        ("看这个 https://t.me/x", "trusted", False, False, False, ["含链接"], "带链接"),
+        ("分享个东西", "trusted", True, False, False, ["含链接预览"], "带预览"),
+        ("点击", "trusted", False, True, False, ["含按钮"], "带按钮"),
+        ("转发内容", "trusted", False, False, True, ["转发消息"], "转发"),
+        ("n", "trusted", False, False, False, ["极短内容"], "极短"),
+        ("你好", "new", False, False, False, ["新成员"], "新成员"),
+    ]
+    for text, trust, pv, bt, fw, expect, note in cases:
+        got = check_triggers(text, trust, pv, bt, fw, 50, 0)
+        # 断言"期望的条件都在"，而非精确相等：一条消息可能同时命中多个条件
+        # （例如两字的按钮文案会同时触发"含按钮"和"极短内容"），这是对的。
+        ok = all(e in got for e in expect)
+        print("  [%s] %-16s -> %-30s %s"
+              % ("OK" if ok else "FAIL", note, got or "无(免AI)", text[:16]))
+        assert ok, "%s 期望包含 %s 实际 %s" % (note, expect, got)
+
+    cid9 = -950
+    db.register_chat(cid9, "免检测试群", "general", shadow_mode=False)
+    db.set_chat_field(cid9, "shadow_mode", 0)
+    db.cache_admins(cid9, [])
+    for _ in range(40):
+        db.upsert_user_seen(cid9, 55, "老群友", None)
+    db.refresh_grace(cid9, 55, True)
+    print("  老群友 trust=trusted 初始额度=%d" % db.grace_left(cid9, 55))
+
+    class CountingClient:
+        def __init__(self):
+            self.calls = 0
+        async def judge(self, messages, user_id, **kw):
+            self.calls += 1
+            ids = [int(l.split("=")[1].split("]")[0])
+                   for l in messages[-1]["content"].splitlines()
+                   if l.startswith("[ID=") and l.split("=")[1][:1].isdigit()]
+            return ({"verdicts": [{"id": i, "confidence": 0.05} for i in ids]},
+                    Usage(cache_hit_tokens=100, cache_miss_tokens=10,
+                          completion_tokens=5, calls=1))
+
+    async def noop18(v):
+        pass
+
+    cc = CountingClient()
+    p18 = ChatPipeline(cid9, cc, noop18, None)
+
+    # (a) 老群友纯闲聊 -> 应跳过 AI
+    rid = db.save_message(cid9, 7001, 55, "老群友", "今天天气不错", None, "t")
+    v = await p18.submit(PendingMessage(rid, 7001, cid9, 55, "老群友",
+                                        "今天天气不错", None, "t"))
+    print("  (a) 老群友闲聊 -> 判定结果=%s 队列=%d (应 None/0，未入队)"
+          % (v, len(p18._fast) + len(p18._slow)))
+    assert v is None and not p18._fast and not p18._slow
+    print("      额度 %d -> %d" % (40, db.grace_left(cid9, 55)))
+
+    # (b) 老群友发链接 -> 必须送 AI 且走快车道。
+    # 注意用普通站外链接：t.me 链接会被 L0 的外部频道规则直接拦掉，
+    # 那样就测不到"触发条件"这条路径了。
+    rid = db.save_message(cid9, 7002, 55, "老群友",
+                          "看 https://example.com/page 这个", None, "t")
+    m_b = PendingMessage(rid, 7002, cid9, 55, "老群友",
+                         "看 https://example.com/page 这个", None, "t")
+    v = await p18.submit(m_b)
+    print("  (b) 老群友发站外链接 -> triggers=%s fast=%s queued=%s"
+          % (m_b.triggers, m_b.fast, bool(p18._fast or p18._slow)))
+    assert m_b.triggers and m_b.fast, "带链接必须送 AI 且走快车道"
+
+    # (c) 新成员闲聊 -> 必须送 AI
+    rid = db.save_message(cid9, 7003, 66, "新人", "大家好", None, "t")
+    m_c = PendingMessage(rid, 7003, cid9, 66, "新人", "大家好", None, "t")
+    await p18.submit(m_c)
+    print("  (c) 新成员闲聊 -> triggers=%s (应含'新成员')" % m_c.triggers)
+    assert "新成员" in m_c.triggers
+
+    # (d) 有前科的老群友 -> 必须送 AI
+    db.bump_user_deleted(cid9, 55, "老群友")
+    for _ in range(5):
+        db.upsert_user_seen(cid9, 55, "老群友", None)
+    p18._profile_cache.clear()          # 刷新画像缓存
+    rid = db.save_message(cid9, 7004, 55, "老群友", "在吗", None, "t")
+    m_d = PendingMessage(rid, 7004, cid9, 55, "老群友", "在吗", None, "t")
+    await p18.submit(m_d)
+    print("  (d) 有前科 -> triggers=%s (应含'曾被删过')" % m_d.triggers)
+    assert any("曾被删" in t for t in m_d.triggers)
+
+    # (e) 额度耗尽 -> 下一条纯闲聊仍应送 AI
+    db.refresh_grace(cid9, 77, True)
+    for _ in range(40):
+        db.upsert_user_seen(cid9, 77, "另一老群友", None)
+    db.execute("UPDATE users SET grace_left=0 WHERE chat_id=? AND user_id=?",
+               (cid9, 77))
+    p19 = ChatPipeline(cid9, cc, noop18, None)
+    rid = db.save_message(cid9, 7005, 77, "另一老群友", "闲聊", None, "t")
+    m_e = PendingMessage(rid, 7005, cid9, 77, "另一老群友", "闲聊", None, "t")
+    await p19.submit(m_e)
+    print("  (e) 额度耗尽 -> 是否入队=%s (应 True，刷满后必送 AI 复核)"
+          % bool(p19._fast or p19._slow))
+    assert p19._fast or p19._slow, "额度耗尽后必须送 AI"
+
+    # (f) 关键保险：跳过 AI 的路径仍在 L0 之后 —— 老群友发手机号应被 L0 拦
+    db.refresh_grace(cid9, 88, True)
+    for _ in range(40):
+        db.upsert_user_seen(cid9, 88, "老群友2", None)
+    p20 = ChatPipeline(cid9, cc, noop18, None)
+    rid = db.save_message(cid9, 7006, 88, "老群友2", "我电话13812345678", None, "t")
+    v = await p20.submit(PendingMessage(rid, 7006, cid9, 88, "老群友2",
+                                        "我电话13812345678", None, "t"))
+    print("  (f) 老群友发手机号 -> L0 是否拦下=%s (应 True，免 AI 不等于不检查)"
+          % (v and v.is_spam))
+    assert v and v.is_spam, "免 AI 额度不能绕过 L0 确定性规则"
+
     os.unlink(tmp)
     print("\n全部通过")
 

@@ -134,6 +134,55 @@ def cmd_words(args) -> None:
         print("  manage.py words -100xxx          # 只看当前词表")
 
 
+def cmd_audit(args) -> None:
+    """审计日志：某个时间窗内机器人做了什么决定、依据是什么。
+
+    对标市面实现的 audit log —— 统计命令只能给总数，审计要能下钻到
+    "某一条消息为什么是这个结果、什么时候、谁、什么依据"。
+    """
+    cid = args.chat_id or 0
+    data = db.audit_window(cid, args.hours, decisions=0, limit=args.limit)
+    s = data["summary"]
+    m = data["messages"]
+
+    print("=" * 82)
+    scope = f"群 {cid}" if cid else "全部群"
+    print(f"  审计报告 · {scope} · 近 {args.hours} 小时")
+    print("=" * 82)
+    print(f"  消息 {m.get('total', 0)} 条，已判定 {m.get('checked', 0)} 条 "
+          f"({(m.get('checked', 0) / m['total'] * 100) if m.get('total') else 0:.0f}%)")
+    print(f"  判定记录 {s.get('total', 0)} 条：删除 {s.get('deleted', 0)} / "
+          f"观察 {s.get('observed', 0)} / 恢复 {s.get('revived', 0)}")
+    print(f"  来源：本地规则 {s.get('by_rule', 0)} 条，AI 判定 {s.get('by_llm', 0)} 条")
+    tot_dec = (s.get("by_rule", 0) or 0) + (s.get("by_llm", 0) or 0)
+    if tot_dec:
+        print(f"  规则承担率 {(s.get('by_rule', 0) or 0) / tot_dec:.0%} "
+              f"（越高说明规则覆盖越好、越少等 AI）")
+
+    print()
+    print("  按来源的置信度分布:")
+    for src, items in db.decision_stats(cid, args.hours).items():
+        parts = " ".join(f"{c:.1f}:{n}" for c, n in items if c is not None)
+        print(f"    {src:12s} {parts}")
+
+    if not args.decisions:
+        return
+    rows = [r for r in data["rows"] if r["action"] == args.decisions][:args.limit]
+    print()
+    print("=" * 82)
+    print(f"  明细（action={args.decisions}，最多 {args.limit} 条）")
+    print("=" * 82)
+    for r in rows:
+        conf = r["confidence"] if r["confidence"] is not None else -1
+        print(f"  #{r['id']} {str(r['created_at'])[11:19]} "
+              f"[{conf:.2f}] {r['source']:10s} "
+              f"{str(r['full_name'] or r['user_id'])[:16]}")
+        print(f"      {str(r['text_snapshot'] or '')[:70]!r}")
+    print()
+    print("用法：manage.py audit [chat_id] [--hours 24] "
+          "[--decisions delete|observe|revive] [--limit 50]")
+
+
 def cmd_learn(args) -> None:
     """自进化：挖候选 / 看验证报告 / 手工触发毕业。
 
@@ -381,6 +430,14 @@ def main() -> None:
 
     c = sub.add_parser("list", help="列出所有群")
     c.set_defaults(func=cmd_list)
+
+    j = sub.add_parser("audit", help="审计日志：某时间窗做了什么决定")
+    j.add_argument("chat_id", nargs="?", type=int, default=0)
+    j.add_argument("--hours", type=int, default=24)
+    j.add_argument("--decisions", choices=["delete", "observe", "revive"],
+                   default="")
+    j.add_argument("--limit", type=int, default=50)
+    j.set_defaults(func=cmd_audit)
 
     i = sub.add_parser("learn", help="自进化：挖候选/看报告/触发毕业")
     i.add_argument("chat_id", type=int)

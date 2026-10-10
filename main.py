@@ -714,6 +714,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         timestamp=ts,
         preview_fp=fp, preview_url=purl, has_preview=has_link_preview(msg),
         button_texts=btns, button_urls=burls,
+        is_forward=bool(getattr(msg, "forward_origin", None)
+                        or getattr(msg, "forward_from", None)),
     )
 
     pipeline = _manager.get(chat.id, on_spam=_make_on_spam(context.application),

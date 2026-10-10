@@ -434,6 +434,64 @@ def record_shadow_hits(text: str, is_spam: bool) -> list[str]:
 _DOMAIN_LIKE = re.compile(r"^[a-z0-9.\-]+\.[a-z]{2,}$", re.I)
 
 
+# ---------------------------------------------------------------------------
+# 自适应检查强度（借鉴 StopSpam）
+# ---------------------------------------------------------------------------
+
+# 触发重新检查的条件。任何一条命中 -> 这条消息必须送 AI，即使发件人是老群友。
+#
+# 设计依据（StopSpam 的做法）：长期干净发言的成员不必每条都查，
+# 只在"触发可疑"时回到审查——发链接、发邀请、转发、久未发言后回归。
+# 这样把 AI 的注意力限制在"它存在的意义上要抓的流量"上。
+#
+# ⚠️ 关键：跳过 AI **不等于不检查**。L0 确定性规则（联系方式/不可见字符/
+# 黑名单/裸字母/重复/外部频道/按钮/自进化规则）永远先跑，全部命中即删。
+# 这里只决定"是否再送 AI 兜底"。
+TRIGGER_NEW_USER = "新成员"
+TRIGGER_FLAGGED = "曾被删过"
+
+
+def check_triggers(text: str, trust: str, has_preview: bool,
+                   has_buttons: bool, is_forward: bool,
+                   msg_count: int = 0,
+                   recent_delete_count: int = 0) -> list[str]:
+    """返回触发的检查条件列表。空列表 = 无需送 AI。
+
+    条件覆盖了"能把广告塞进来"的所有形态，所以跳过 AI 不会漏掉广告载体：
+      · 链接 / t.me / 按钮 / 预览 —— 引流必备
+      · 转发 —— 广告常用手法
+      · 新成员 —— 老群友才享免检
+      · 曾被删过 —— 有前科的不信任
+      · 含联系方式（手机号）—— 已在 L0 覆盖，这里再兜一次
+    """
+    reasons: list[str] = []
+    t = text or ""
+
+    if trust in ("new",):
+        reasons.append(TRIGGER_NEW_USER)
+    if trust == "repeat" or recent_delete_count > 0:
+        reasons.append(TRIGGER_FLAGGED)
+
+    # 链接类：引流必备载体
+    if extract_tme_identifiers(t) or _URL_ANY.search(t):
+        reasons.append("含链接")
+    if has_preview:
+        reasons.append("含链接预览")
+    if has_buttons:
+        reasons.append("含按钮")
+    if is_forward:
+        reasons.append("转发消息")
+
+    # 极短内容：可能是单字母刷屏或拆分文案
+    if len(t.strip()) <= 3:
+        reasons.append("极短内容")
+
+    return reasons
+
+
+_URL_ANY = re.compile(r"https?://|www\.", re.I)
+
+
 def check_repeat(text: str, recent_texts: list[str], threshold: int = 3) -> Verdict:
     """重复刷屏检测。
 

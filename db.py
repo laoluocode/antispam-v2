@@ -315,6 +315,12 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "messages": [
             ("retry_count", "INTEGER DEFAULT 0"),
         ],
+        "users": [
+            # 自适应检查强度（借鉴 StopSpam）：长期干净发言的成员不必每条都送 AI，
+            # 但**只是跳过 AI**，L0 确定性规则与所有触发条件仍然生效。
+            ("last_clean_at", "DATETIME"),
+            ("grace_left", "INTEGER DEFAULT 0"),
+        ],
     }
     for table, cols in additions.items():
         have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
@@ -486,6 +492,45 @@ def bump_user_deleted(chat_id: int, user_id: int,
             del_count = del_count + 1,
             full_name = COALESCE(excluded.full_name, users.full_name)
     """, (chat_id, user_id, full_name, now, now))
+
+
+# 长期干净发言的成员享有多少条"免 AI"额度。
+# 额度耗尽后下一条消息会重新送 AI 复核——这样即使账号被慢慢养熟后变坏，
+# 也最多漏过 GRACE_MESSAGES 条，不会永久失守。
+GRACE_MESSAGES = 30
+
+# 额度可刷新的条件：这次送 AI 判定的结果是"干净"
+def refresh_grace(chat_id: int, user_id: int, reset: bool = False) -> None:
+    """刷新免检额度。
+
+    reset=True 用于"刚被 AI 复核且判为干净"的情形——重新给满额度。
+    额度是计数的而非计时的：既避免按时间窗口漏判，也让行为可预期。
+    """
+    now = _now()
+    if reset:
+        execute("""UPDATE users SET grace_left=?, last_clean_at=?
+                   WHERE chat_id=? AND user_id=?""",
+                (GRACE_MESSAGES, now, chat_id, user_id))
+    else:
+        execute("""UPDATE users SET grace_left = MAX(0, grace_left - 1)
+                   WHERE chat_id=? AND user_id=?""", (chat_id, user_id))
+
+
+def consume_grace(chat_id: int, user_id: int) -> int:
+    """消耗一次额度，返回剩余额度。"""
+    with tx() as conn:
+        conn.execute("""UPDATE users SET grace_left = MAX(0, grace_left - 1)
+                        WHERE chat_id=? AND user_id=?""", (chat_id, user_id))
+        row = conn.execute("""SELECT grace_left FROM users
+                              WHERE chat_id=? AND user_id=?""",
+                           (chat_id, user_id)).fetchone()
+    return row["grace_left"] if row else 0
+
+
+def grace_left(chat_id: int, user_id: int) -> int:
+    row = query_one("""SELECT grace_left FROM users
+                       WHERE chat_id=? AND user_id=?""", (chat_id, user_id))
+    return (row["grace_left"] or 0) if row else 0
 
 
 def user_stats(chat_id: int, user_id: int) -> dict:
@@ -741,6 +786,77 @@ def recent_spam_records(chat_id: int, limit: int = 10) -> list[sqlite3.Row]:
 
 def get_spam_record(record_id: int):
     return query_one("SELECT * FROM spam_records WHERE id=?", (record_id,))
+
+
+def audit_window(chat_id: int = 0, hours: int = 24, decisions: int = 0,
+                 limit: int = 500) -> dict:
+    """审计某个时间窗内的判定情况。
+
+    存在的理由（对标市面实现的 audit log）：管理员需要能回答
+      · 这条为什么被删？什么时候删的？谁删的？
+      · 这段时间机器人一共做了多少决定？有多少是我不同意的？
+    统计类命令（/status、manage.py cost）只能给总数，
+    不能下钻到"某一条具体消息为什么是这个结果"。
+    """
+    where = ["created_at >= datetime('now', ?)"]
+    args: list = [f"-{hours} hours"]
+    if chat_id:
+        where.append("chat_id = ?")
+        args.append(chat_id)
+    if decisions:
+        where.append("action = ?")
+        args.append(decisions)
+    clause = " AND ".join(where)
+
+    rows = query(f"""
+        SELECT id, chat_id, user_id, full_name, message_id, text_snapshot,
+               confidence, source, action, created_at
+        FROM spam_records WHERE {clause}
+        ORDER BY id DESC LIMIT ?
+    """, (*args, limit))
+
+    summary = query_one(f"""
+        SELECT COUNT(*) total,
+               SUM(CASE WHEN action='delete' THEN 1 ELSE 0 END) deleted,
+               SUM(CASE WHEN action='observe' THEN 1 ELSE 0 END) observed,
+               SUM(CASE WHEN action='revive' THEN 1 ELSE 0 END) revived,
+               SUM(CASE WHEN source='local_rule' THEN 1 ELSE 0 END) by_rule,
+               SUM(CASE WHEN source='llm' THEN 1 ELSE 0 END) by_llm
+        FROM spam_records WHERE {clause}
+    """, tuple(args))
+
+    # 消息层面的统计（用来判断"漏没漏"）
+    msg_where = ["timestamp >= datetime('now', ?)"]
+    msg_args: list = [f"-{hours} hours"]
+    if chat_id:
+        msg_where.append("chat_id = ?")
+        msg_args.append(chat_id)
+    msg = query_one(f"""
+        SELECT COUNT(*) total,
+               SUM(CASE WHEN is_checked=1 THEN 1 ELSE 0 END) checked
+        FROM messages WHERE {' AND '.join(msg_where)}
+    """, tuple(msg_args))
+
+    return {"rows": rows, "summary": dict(summary) if summary else {},
+            "messages": dict(msg) if msg else {}}
+
+
+def decision_stats(chat_id: int = 0, hours: int = 24) -> dict:
+    """判定分布，用于观察"AI 与规则各承担了多少"。"""
+    where = ["created_at >= datetime('now', ?)"]
+    args: list = [f"-{hours} hours"]
+    if chat_id:
+        where.append("chat_id = ?")
+        args.append(chat_id)
+    clause = " AND ".join(where)
+    out = {}
+    for r in query(f"""
+        SELECT source, confidence, COUNT(*) n FROM spam_records
+        WHERE {clause} GROUP BY source, ROUND(confidence, 1)
+        ORDER BY source, confidence
+    """, tuple(args)):
+        out.setdefault(r["source"], []).append((r["confidence"], r["n"]))
+    return out
 
 
 def recent_spam_records_all(limit: int = 20) -> list[sqlite3.Row]:

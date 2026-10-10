@@ -37,6 +37,7 @@ from detector_rules import (
     check_learned_patterns,
     check_local,
     check_repeat,
+    check_triggers,
     compute_trust,
     load_patterns,
     record_shadow_hits,
@@ -109,6 +110,10 @@ class PendingMessage:
     # inline 按钮：广告号把广告做成按钮，正文可以只是一个表情
     button_texts: list[str] = field(default_factory=list)
     button_urls: list[str] = field(default_factory=list)
+    is_forward: bool = False
+    # 触发重新检查的原因（空 = 享免 AI 额度）
+    triggers: list[str] = field(default_factory=list)
+    skipped_llm: bool = False
 
     @property
     def marker(self) -> str:
@@ -283,12 +288,43 @@ class ChatPipeline:
                     msg, True, 1.0, "local_rule",
                     f"协同引流（{senders} 个账号指向同一预览目标）")
 
+        # --- 自适应检查强度（借鉴 StopSpam）---
+        # 长期干净发言的老群友不必每条都送 AI。但**这只是跳过 AI**：
+        # L0 确定性规则（联系方式/不可见字符/黑名单/裸字母/重复/外部频道/
+        # 按钮/自进化规则）已经在上面全部跑过，命中即删，与是否送 AI 无关。
+        #
+        # 保险措施：
+        #   · 任何触发条件命中 -> 送 AI，且强制走快车道
+        #   · 额度是计数的（30 条），刷满后下一条必送 AI 复核
+        #   · 只在 trust=trusted 时生效，新成员/有前科的每条都查
+        flagged = stats["del_n"] > 0
+        triggers = check_triggers(
+            msg.text, trust, msg.has_preview,
+            bool(msg.button_texts or msg.button_urls),
+            msg.is_forward, stats["msg_n"],
+            1 if flagged else 0,
+        )
+        msg.triggers = triggers
+
+        if trust == "trusted" and not triggers:
+            left = await asyncio.to_thread(db.grace_left, self.chat_id, msg.user_id)
+            if left > 0:
+                await asyncio.to_thread(
+                    db.consume_grace, self.chat_id, msg.user_id)
+                await asyncio.to_thread(db.mark_checked, [msg.row_id])
+                msg.skipped_llm = True
+                logger.debug(
+                    "免AI额度 chat=%s user=%s 剩余=%d text=%r",
+                    self.chat_id, msg.user_id, left - 1, (msg.text or "")[:30])
+                return None
+
         # --- 分流 ---
         cut = cfg["confidence_cut"]
         # 不可见字符占比高：广告号的强特征，插队到快车道
         suspicious = (len(msg.text) >= INVISIBLE_MIN_LENGTH
                       and invisible_ratio(msg.text) >= INVISIBLE_RATIO_THRESHOLD)
-        msg.fast = trust in FASTLANE_TRUST_LEVELS or suspicious
+        msg.fast = (trust in FASTLANE_TRUST_LEVELS or suspicious
+                    or bool(triggers))
         if level == "advertiser":
             msg.fast = False  # 付费商家不抢快车道资源
 
@@ -440,6 +476,16 @@ class ChatPipeline:
                     record_shadow_hits, m.text, conf >= cut)
             except Exception:  # noqa: BLE001
                 pass
+
+        # 判定完成后刷新免检额度：判为干净的重新给满，这样老群友的
+        # 日常闲聊不会再被逐条送 AI，而一旦出现广告就立刻回到审查。
+        for m in batch:
+            conf = scores.get(m.row_id)
+            if conf is None:
+                continue
+            if conf < cut:
+                await asyncio.to_thread(
+                    db.refresh_grace, self.chat_id, m.user_id, True)
 
         # 判定成功的部分立即标记已检测。
         # 漏掉这一步会让消息永远停在未检测状态，每轮被重新取出来判定。
