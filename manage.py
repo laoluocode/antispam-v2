@@ -132,6 +132,46 @@ def cmd_words(args) -> None:
         print("  manage.py words -100xxx          # 只看当前词表")
 
 
+def cmd_cost(args) -> None:
+    """成本报告：观察真实日消费，用于定预算。
+
+    注意历史数据的计价口径：早先的实现把所有调用都按高峰价估算，
+    而空闲时段（含全部周末）实际价格减半，所以**早期记录约偏高两倍**。
+    现在计价按当前时段自动判断。
+    """
+    days = db.usage_daily_total(args.days)
+    if not days:
+        print("暂无用量记录。")
+        return
+    print(f"近 {args.days} 天成本（元）:")
+    print(f"  {'日期':<12} {'调用':>7} {'缓存命中率':>10} {'成本':>10}")
+    print("  " + "-" * 44)
+    for d in days:
+        h, m = d["hit_tokens"] or 0, d["miss_tokens"] or 0
+        rate = h / (h + m) if (h + m) else 0
+        print(f"  {d['usage_date']:<12} {d['calls']:>7} {rate:>9.0%} "
+              f"{d['cost_yuan']:>9.4f}")
+    total = sum(d["cost_yuan"] or 0 for d in days)
+    print("  " + "-" * 44)
+    print(f"  {'合计':<12} {'':>7} {'':>10} {total:>9.4f}")
+    if days:
+        print(f"  日均: {total / len(days):.4f} 元/天")
+
+    print()
+    print("  今日各群明细:")
+    today = days[0]["usage_date"] if days else ""
+    print(f"  {'chat_id':>17} {'调用':>6} {'命中率':>7} {'成本':>10}")
+    for r in db.usage_by_day(args.days):
+        if r["usage_date"] != today:
+            continue
+        h, m = r["hit_tokens"] or 0, r["miss_tokens"] or 0
+        rate = h / (h + m) if (h + m) else 0
+        title = db.get_chat(r["chat_id"])
+        name = (title["title"] if title else "") or ""
+        print(f"  {r['chat_id']:>17} {r['calls']:>6} {rate:>6.0%} "
+              f"{r['cost_yuan']:>9.4f}  {str(name)[:18]}")
+
+
 def cmd_gbl(args) -> None:
     """全局黑名单：跨群生效的账号黑名单。
 
@@ -265,6 +305,10 @@ def main() -> None:
 
     c = sub.add_parser("list", help="列出所有群")
     c.set_defaults(func=cmd_list)
+
+    h = sub.add_parser("cost", help="成本报告（观察真实日消费）")
+    h.add_argument("--days", type=int, default=7)
+    h.set_defaults(func=cmd_cost)
 
     g = sub.add_parser("gbl", help="全局黑名单（跨群生效）")
     g.add_argument("--add", type=int, help="加入一个 user_id")

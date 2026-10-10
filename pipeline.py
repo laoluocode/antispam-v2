@@ -61,19 +61,15 @@ ADVERTISER_CUT = 0.85
 PROFILE_TTL = 30.0
 ADMIN_TTL = 300.0
 
-# 最小批大小门槛。**这是每调用成本的关键。**
+# 最小批大小门槛：0 表示不设门槛，到时间窗就发。
 #
-# 实测问题（2026-10-10，上线 8 小时）：平均批大小只有 2.0 条，而每次调用
-# 要重发约 1,685 token 的稳定前缀 —— 单次调用 2,079 token 里 81% 是固定开销。
-# 结果 300k 的日预算只够 144 次调用，下午 4-5 点就把预算烧光，
-# 后半天的消息全部没判定。
+# 背景：实测发现每次调用要重发约 1,685 token 的稳定前缀，而平均批只有 2 条，
+# 导致 81% 的 token 花在固定开销上。设门槛能把单条摊薄成本降约 10 倍。
 #
-# 修法：队列里消息不够就不急着发，等攒够或超时。
-# 好处是自适应——忙群几分钟就攒够，闲群走超时，不需要按群调参。
-#
-# 计算：20 条一批时，前缀只占 1,685/(1,685+20*9+25) ≈ 89%... 不对，
-# 是前缀的**单条摊薄**从 842 token/条 降到 84 token/条，降低 10 倍。
-MIN_BATCH_FAST = 20
+# 但**实时性优先时可关掉**：门槛让快车道从"最多等 15 秒"变成"最多等攒够 20 条"，
+# 在低流量群可能等很久。当前按"实时性优先"配置：快车道 0（15 秒必发），
+# 慢车道保留小额门槛避免过度调用。
+MIN_BATCH_FAST = 0    # 0 = 不设门槛，快车道严格按窗口触发
 MIN_BATCH_SLOW = 40
 
 # 协同刷屏阈值：同一预览目标在 24h 内被多少个不同账号引用。
@@ -336,9 +332,11 @@ class ChatPipeline:
                 n_fast, n_slow = len(self._fast), len(self._slow)
 
             # 触发条件：攒够最小批 或 到时间窗。
-            # 攒够优先——忙群几分钟就够一批，闲群走超时，自适应无需按群调参。
-            fire_fast = n_fast >= MIN_BATCH_FAST or (now >= fast_deadline and n_fast)
-            fire_slow = n_slow >= MIN_BATCH_SLOW or (now >= slow_deadline and n_slow)
+            # 门槛为 0 时退化为纯粹的窗口触发（实时性优先）。
+            fire_fast = ((MIN_BATCH_FAST > 0 and n_fast >= MIN_BATCH_FAST)
+                         or (now >= fast_deadline and n_fast))
+            fire_slow = ((MIN_BATCH_SLOW > 0 and n_slow >= MIN_BATCH_SLOW)
+                         or (now >= slow_deadline and n_slow))
 
             if fire_fast or fire_slow:
                 batch: list[PendingMessage] = []
@@ -373,8 +371,9 @@ class ChatPipeline:
         # 且不会重试 —— 等于永久静默丢失。实测线上有 2,370 条消息是这样被吞掉的，
         # 其中混着真广告。现在改为：回队 + 告警（有重试上限兜底，不会无限堆积）。
         used = await asyncio.to_thread(db.tokens_used_today, self.chat_id)
-        cap = int(cfg.get("daily_token_cap", 2000000))
-        if used >= cap:
+        cap = int(cfg.get("daily_token_cap") or 0)
+        # cap <= 0 表示不限量。测试期用它观察真实日消费，之后再定阈值。
+        if cap > 0 and used >= cap:
             keep = await asyncio.to_thread(
                 db.bump_retry, [m.row_id for m in batch])
             logger.warning(
@@ -403,7 +402,7 @@ class ChatPipeline:
                     self._requeue, [m for m in batch if m.row_id in set(keep)])
             return
 
-        cost = estimate_cost_yuan(usage, peak=True)
+        cost = estimate_cost_yuan(usage)  # 按时段自动判断
         await asyncio.to_thread(
             db.record_usage, self.chat_id, usage.calls,
             usage.cache_hit_tokens, usage.cache_miss_tokens,

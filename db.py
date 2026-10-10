@@ -1186,6 +1186,33 @@ def usage_today(chat_id: int) -> dict:
     return d
 
 
+def usage_by_day(days: int = 7) -> list[sqlite3.Row]:
+    """近 N 天各群的用量，用于观察真实日消费。"""
+    return query("""
+        SELECT usage_date, chat_id, calls, hit_tokens, miss_tokens,
+               output_tokens, cost_yuan
+        FROM token_usage
+        ORDER BY usage_date DESC, cost_yuan DESC
+        LIMIT ?
+    """, (days * 20,))
+
+
+def usage_daily_total(days: int = 7) -> list[sqlite3.Row]:
+    """近 N 天合计（按天）。"""
+    return query("""
+        SELECT usage_date,
+               SUM(calls) calls,
+               SUM(hit_tokens) hit_tokens,
+               SUM(miss_tokens) miss_tokens,
+               SUM(output_tokens) output_tokens,
+               SUM(cost_yuan) cost_yuan
+        FROM token_usage
+        GROUP BY usage_date
+        ORDER BY usage_date DESC
+        LIMIT ?
+    """, (days,))
+
+
 def tokens_used_today(chat_id: int) -> int:
     u = usage_today(chat_id)
     return (u["hit_tokens"] or 0) + (u["miss_tokens"] or 0) + (u["output_tokens"] or 0)

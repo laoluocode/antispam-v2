@@ -29,6 +29,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any
 
 from openai import AsyncOpenAI
@@ -93,8 +94,9 @@ class Usage:
         )
 
 
-# 官方定价（元 / 百万 token）。高峰时段为工作日 9:00-12:00 与 14:00-18:00，
-# 其余时段（含全部周末与法定节假日）价格减半。
+# 官方定价（元 / 百万 token，高峰时段价）。
+# 高峰 = 周一至周五 9:00-12:00 与 14:00-18:00（北京时间）；
+# **其余时段（含全部周末与法定节假日）价格减半**。
 PRICE_YUAN_PER_MILLION = {
     "cache_hit": 0.04,
     "cache_miss": 2.00,
@@ -102,8 +104,38 @@ PRICE_YUAN_PER_MILLION = {
 }
 
 
-def estimate_cost_yuan(usage: Usage, peak: bool = True) -> float:
-    """按官方定价估算成本。默认按高峰时段（最贵）计算，保守估计。"""
+def is_peak_now(now=None) -> bool:
+    """当前是否处于高峰计费时段。
+
+    早先的实现在所有调用处硬编码 peak=True，等于**按最贵时段估算**，
+    而空闲时段（含全部周末）实际价格减半——估算值约为真实值的两倍。
+    这会让预算判断偏保守，但也会让我们误判成本规模。
+    """
+    try:
+        import pytz
+    except ImportError:
+        return True
+    tz = pytz.timezone("Asia/Shanghai")
+    t = now or datetime.now(tz)
+    if t.tzinfo is None:
+        t = tz.localize(t)
+    else:
+        t = t.astimezone(tz)
+    # 周末整体算空闲
+    if t.weekday() >= 5:
+        return False
+    h = t.hour
+    return (9 <= h < 12) or (14 <= h < 18)
+
+
+def estimate_cost_yuan(usage: Usage, peak: bool | None = None) -> float:
+    """按官方定价估算成本。
+
+    peak=None 时**自动按当前时段**判断——这才能反映真实支出。
+    显式传 True/False 用于回测与对比。
+    """
+    if peak is None:
+        peak = is_peak_now()
     factor = 1.0 if peak else 0.5
     return factor * (
         usage.cache_hit_tokens * PRICE_YUAN_PER_MILLION["cache_hit"]
