@@ -134,6 +134,68 @@ def cmd_words(args) -> None:
         print("  manage.py words -100xxx          # 只看当前词表")
 
 
+def cmd_health(args) -> None:
+    """判定健康度：观察阈值漂移、语料倾斜、人工推翻率。
+
+    为什么需要（Gmail 垃圾邮件分类器故障的教训）：阈值漂移往往发生在
+    **模型本身没变**的情况下——用户行为或广告手法的分布变了，
+    原本合适的阈值就突然不合适，表现为"开始大量误删"。
+    只看总面积（删了多少）发现不了，要看分布形状与人工推翻率。
+    """
+    cid = args.chat_id or 0
+    h = db.verdict_health(cid, args.hours)
+    scope = f"群 {cid}" if cid else "全部群"
+
+    print("=" * 74)
+    print(f"  判定健康度 · {scope} · 近 {args.hours} 小时")
+    print("=" * 74)
+
+    # 1) 预测分布（双峰 vs 中间堆积）
+    print("  ① 预测分布（AI 判定的置信度分桶）")
+    tot = h["llm_total"]
+    if tot:
+        for k in ("very_high(>0.9)", "high(>0.7)", "mid(0.3-0.7)", "low(<0.3)"):
+            n = h["buckets"][k]
+            bar = "#" * int(n / tot * 40)
+            print("     %-14s %5d (%5.1f%%) %s" % (k, n, n / tot * 100, bar))
+        mid = h["buckets"]["mid(0.3-0.7)"] / tot
+        if mid > 0.35:
+            print("     ⚠ 中间区间占比 %.0f%% 偏高——分布不像双峰，"
+                  "可能有特征漂移（建议复核判断尺度）" % (mid * 100))
+        else:
+            print("     ✓ 中间区间占比 %.0f%%，分布健康（高/低分集中）" % (mid * 100))
+    else:
+        print("     （无 AI 判定样本）")
+
+    # 2) 人工推翻率
+    print()
+    print("  ② 人工推翻率（最直接的用户不满信号）")
+    print("     删除 %d 条，恢复 %d 条 -> 推翻率 %.1f%%"
+          % (h["deleted"], h["revived"], h["revive_rate"] * 100))
+    if h["revive_rate"] > 0.05:
+        print("     ⚠ 超过 5%%，说明判定偏严，建议提高阈值或补充正常词表")
+    elif h["deleted"] and h["revived"] == 0:
+        print("     ✓ 无推翻（但也要留意'用户懒得点恢复'的情况）")
+    else:
+        print("     ✓ 推翻率正常")
+
+    # 3) 语料倾斜
+    print()
+    print("  ③ 语料倾斜（自进化闸门依赖正常语料）")
+    print("     广告 %d 条 / 正常 %d 条 -> 倾斜度 %.2f"
+          % (h["spam_n"], h["ham_n"], h["skew"]))
+    from learner import MIN_HAM_PER_SPAM
+    ham_ratio = h["ham_n"] / max(1, h["spam_n"])
+    if ham_ratio < MIN_HAM_PER_SPAM:
+        print("     ⚠ 正常语料不足（比值 %.2f < %.2f），"
+              "自进化已暂停以免证据不足时放权" % (ham_ratio, MIN_HAM_PER_SPAM))
+    else:
+        print("     ✓ 正常语料充足，闸门可靠")
+
+    print()
+    print("用法：manage.py health [chat_id] [--hours 24]")
+
+
 def cmd_audit(args) -> None:
     """审计日志：某个时间窗内机器人做了什么决定、依据是什么。
 
@@ -430,6 +492,11 @@ def main() -> None:
 
     c = sub.add_parser("list", help="列出所有群")
     c.set_defaults(func=cmd_list)
+
+    k = sub.add_parser("health", help="判定健康度（阈值漂移/语料倾斜/推翻率）")
+    k.add_argument("chat_id", nargs="?", type=int, default=0)
+    k.add_argument("--hours", type=int, default=24)
+    k.set_defaults(func=cmd_health)
 
     j = sub.add_parser("audit", help="审计日志：某时间窗做了什么决定")
     j.add_argument("chat_id", nargs="?", type=int, default=0)

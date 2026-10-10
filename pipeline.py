@@ -241,13 +241,23 @@ class ChatPipeline:
                 v = check_repeat(msg.text, history, REPEAT_THRESHOLD)
             # 单字符刷屏：广告号用裸字母当载体，广告内容在频道预览里，
             # bot 只能拿到字母本身（实测漏判案例）。
-            # 受信任群友豁免：真实群友之间偶尔发几个 ok/hi 很正常，
-            # 而这个规则是"宁可严格"型的行为特征，用信任档位兜住误伤。
-            if not v.hit and trust != "trusted":
+            #
+            # **不再按信任档位豁免。** 理由（借鉴 tg-spam 的设计）：
+            # "重复/行为类检测对所有用户生效，包括已批准用户——已批准用户
+            # 仍可能通过重复消息刷屏，这个模式应无视信任状态被检测。"
+            # 我们原来的豁免留了个缺口：老群友账号被盗后发裸字母完全不被拦。
+            #
+            # 误伤风险由白名单承担而非信任档位：白名单已涵盖 ok/no/hi/up/dd/
+            # thx/yes/id/qq/vx 与全部数字（实测老库 '1' 出现 282 次都是正常回应），
+            # 而"反复发不在白名单里的裸字母"本身就是异常行为。
+            if not v.hit:
                 v = check_bare_letter_spam(msg.text, history)
 
         if v.hit:
             await asyncio.to_thread(db.mark_checked, [msg.row_id])
+            await asyncio.to_thread(db.log_verdict, self.chat_id,
+                                    msg.message_id, msg.user_id, 1.0,
+                                    "local_rule", True, ",".join(msg.triggers))
             return Verdict(msg, True, 1.0, "local_rule", v.reason)
 
         # --- 自进化规则（已毕业的直拦）---
@@ -474,6 +484,20 @@ class ChatPipeline:
             try:
                 await asyncio.to_thread(
                     record_shadow_hits, m.text, conf >= cut)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # 记录**全部**判定（含判为正常的），供分布漂移监控使用。
+        # 只记删除记录会产生幸存者偏差，看不到阈值附近的真实堆积。
+        for m in batch:
+            conf = scores.get(m.row_id)
+            if conf is None:
+                continue
+            try:
+                await asyncio.to_thread(
+                    db.log_verdict, self.chat_id, m.message_id, m.user_id,
+                    conf, "llm", conf >= cut,
+                    ",".join(m.triggers))
             except Exception:  # noqa: BLE001
                 pass
 

@@ -299,9 +299,12 @@ async def main():
         assert not check_bare_letter_spam(w, ["在的", "嗯", "好的"]).hit, w
     print("  中文短回应不触发: 在的/嗯/好的/收到/在呢/谁/好/哦/哈喽/有空/导航/签到")
 
-    # 受信任用户豁免
+    # 行为类检测**不再按信任档位豁免**（借鉴 tg-spam 的设计：
+    # "重复/行为类检测对所有用户生效——已批准用户仍可能通过重复消息刷屏"）。
+    # 原来的豁免留了个缺口：老群友账号被盗后发裸字母完全不被拦。
+    # 误伤风险由白名单承担：白名单已涵盖 ok/hi/no/dd/1/66/88 等常见短回应。
     cid4 = -400
-    db.register_chat(cid4, "豁免测试群", "general", shadow_mode=False)
+    db.register_chat(cid4, "行为检测测试群", "general", shadow_mode=False)
     db.set_chat_field(cid4, "shadow_mode", 0)
     for _ in range(40):
         db.upsert_user_seen(cid4, 42, "老群友", None)
@@ -310,9 +313,21 @@ async def main():
     rid = db.save_message(cid4, 8100, 42, "老群友", "x", None, "t")
     p13 = ChatPipeline(cid4, fake, noop, None)
     v13 = await p13.submit(PendingMessage(rid, 8100, cid4, 42, "老群友", "x", None, "t"))
-    print("  受信任群友发裸字母: %s（应为 None=未判删）"
+    print("  老群友反复发裸字母: %s（现在应命中——账号可能被盗）"
           % ("命中" if (v13 and v13.is_spam) else "未命中"))
-    assert not (v13 and v13.is_spam), "trusted 用户应豁免单字符规则"
+    assert v13 and v13.is_spam, "行为类检测不应按信任档位豁免"
+
+    # 但老群友发白名单里的常见短回应仍然安全
+    for i, w in enumerate(("ok", "hi", "1", "66", "导航", "签到")):
+        db.save_message(cid4, 8200 + i, 43, "老群友2", w, None, "t")
+        r2 = db.save_message(cid4, 8300 + i, 43, "老群友2", w, None, "t")
+    p13b = ChatPipeline(cid4, fake, noop, None)
+    r3 = db.save_message(cid4, 8400, 43, "老群友2", "ok", None, "t")
+    v13b = await p13b.submit(PendingMessage(r3, 8400, cid4, 43, "老群友2",
+                                            "ok", None, "t"))
+    print("  老群友发 'ok': %s（应不命中，白名单兜住误伤）"
+          % ("命中" if (v13b and v13b.is_spam) else "未命中"))
+    assert not (v13b and v13b.is_spam), "白名单里的短回应不该被拦"
 
     print("=== 14. 回归：外部频道引流检测 ===")
     from detector_rules import check_external_channel_link, extract_tme_identifiers
@@ -668,6 +683,100 @@ async def main():
     print("  load_corpus(limit=5) -> 返回 spam=%d ham=%d（并已告警，不静默）"
           % (len(sp), len(ha)))
     assert len(sp) <= 5 and len(ha) <= 5
+
+    print("=== 20. 回归：判定记录不丢正常样本 / 健康度不偏差 ===")
+    # Gmail 阈值漂移监控的教训：只看"被判为广告的样本"会产生幸存者偏差，
+    # 低分区永远为空，看不到阈值附近的真实堆积——而漂移最早就在那里显现。
+    cidH = -970
+    db.register_chat(cidH, "健康度测试群", "general", shadow_mode=False)
+    db.set_chat_field(cidH, "shadow_mode", 0)
+
+    class Graded:
+        def __init__(self, scores):
+            self.scores = scores
+        async def judge(self, messages, user_id, **kw):
+            ids = [int(l.split("=")[1].split("]")[0])
+                   for l in messages[-1]["content"].splitlines()
+                   if l.startswith("[ID=") and l.split("=")[1][:1].isdigit()]
+            return ({"verdicts": [{"id": i, "confidence": self.scores.get(i, 0.1)}
+                                  for i in ids]},
+                    Usage(cache_hit_tokens=100, cache_miss_tokens=10,
+                          completion_tokens=5, calls=1))
+
+    # 注意：_judge 通过 on_spam 回调触发实际删除，传 noop 就测不到删除路径
+    deleted20 = []
+
+    async def on_spam20(v):
+        deleted20.append(v)
+
+    # 造 4 条：1 条高分删除、3 条低分保留（模拟真实分布）
+    texts = [("广告内容测试", 0.95), ("正常聊天一", 0.05),
+             ("正常聊天二", 0.10), ("正常聊天三", 0.02)]
+    batch = []
+    for i, (t, _s) in enumerate(texts):
+        rid = db.save_message(cidH, 9000 + i, 21, "某人", t, None, "t")
+        batch.append(PendingMessage(rid, 9000 + i, cidH, 21, "某人", t, None, "t"))
+    # prompt 里的 ID 是**真实记录 ID**（row_id），不是批内序号，
+    # 所以分数映射必须用 m.row_id 做键。硬编码 1..4 在套件里必然对不上——
+    # 自增 row_id 已经被前面的测试推到 140 以上，于是全部落到默认分。
+    scores20 = {m.row_id: c for m, (_t, c) in zip(batch, texts)}
+    print("  row_id->分数: %s（row_id 非连续，必须按真实 ID 映射）" % scores20)
+    await ChatPipeline(cidH, Graded(scores20), on_spam20, None)._judge(batch)
+    print("  on_spam 回调触发 %d 次（高分那条）" % len(deleted20))
+    assert len(deleted20) == 1, "只有 0.95 那条该被删"
+
+    rows = db.query("SELECT confidence, deleted FROM verdict_log WHERE chat_id=?",
+                    (cidH,))
+    print("  verdict_log 记录 %d 条（应 =4，含被判为正常的）" % len(rows))
+    for r in sorted(rows, key=lambda x: -(x["confidence"] or 0)):
+        print("     conf=%.2f deleted=%s" % (r["confidence"], r["deleted"]))
+    assert len(rows) == 4, "必须记录全部判定，不能只记删除"
+    kept = [r for r in rows if r["deleted"] == 0]
+    print("  其中判为正常（未删）= %d 条 —— 这些正是旧实现会丢掉的样本" % len(kept))
+    assert len(kept) == 3, "低分样本必须留存，否则分布分析有幸存者偏差"
+
+    h = db.verdict_health(cidH, 24)
+    print("  健康度分布: %s" % h["buckets"])
+    assert h["buckets"]["low(<0.3)"] == 3, "低分区应有 3 条（旧实现恒为 0）"
+    assert h["buckets"]["very_high(>0.9)"] == 1
+
+    # L0 命中也要进判定记录
+    db.save_message(cidH, 9100, 21, "某人", "我电话13812345678", None, "t")
+    p21 = ChatPipeline(cidH, Graded({}), on_spam20, None)
+    rid = db.query("SELECT id FROM messages WHERE chat_id=? AND message_id=9100",
+                   (cidH,))[0]["id"]
+    await p21.submit(PendingMessage(rid, 9100, cidH, 21, "某人",
+                                    "我电话13812345678", None, "t"))
+    n_l0 = db.query("""SELECT COUNT(*) n FROM verdict_log
+                       WHERE chat_id=? AND source='local_rule'""", (cidH,))[0]["n"]
+    print("  L0 命中写入判定记录: %d 条（应 >=1）" % n_l0)
+    assert n_l0 >= 1
+
+    print("=== 21. 回归：数据库结构自检（防静默缺表）===")
+    # 线上真实踩到过：verdict_log 加进 SCHEMA 后，因为容器没有真正重启，
+    # 表没被创建，而调用方把异常吞掉了 —— 表现为"功能上线了但数据是空的"。
+    # 自检把这种情况变成启动日志里的一行 ERROR。
+    import sqlite3 as _sq
+    tmp2 = tmp + ".schema"
+    db.init_db(tmp2)
+    missing = db.verify_schema(tmp2)
+    print("  全新库自检: 缺表=%s（应为空）" % (missing or "无"))
+    assert not missing, "全新库不应缺表"
+
+    conn = _sq.connect(tmp2)
+    conn.execute("DROP TABLE verdict_log")
+    conn.commit()
+    conn.close()
+    missing = db.verify_schema(tmp2)
+    print("  删掉 verdict_log 后自检: 缺表=%s" % missing)
+    assert "verdict_log" in missing, "自检必须能发现缺表"
+
+    # init_db 重跑应把表补回来（CREATE TABLE IF NOT EXISTS 是幂等的）
+    db.init_db(tmp2)
+    missing = db.verify_schema(tmp2)
+    print("  重跑 init_db 后自检: 缺表=%s（应补回）" % (missing or "无"))
+    assert not missing, "init_db 应补回缺失的表"
+    os.unlink(tmp2)
 
     os.unlink(tmp)
     print("\n全部通过")

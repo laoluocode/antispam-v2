@@ -249,6 +249,26 @@ CREATE TABLE IF NOT EXISTS global_blacklist (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 全部判定记录（含"判定为正常"的）。
+--
+-- 为什么不能只用 spam_records 做分布分析：那张表只记删除/观察/恢复，
+-- 也就是**只有被判定为广告的消息**。用它看"预测分布"是幸存者偏差——
+-- 低分区（被判为正常）的样本压根不存在，于是永远看不到阈值附近堆积。
+-- 而阈值漂移最早的表现恰恰是"中间置信度样本比例上升"。
+CREATE TABLE IF NOT EXISTS verdict_log (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id     INTEGER NOT NULL,
+    message_id  INTEGER NOT NULL,
+    user_id     INTEGER,
+    confidence  REAL,                    -- LLM 给的原始置信度
+    source      TEXT,                    -- llm | learned | local_rule
+    deleted     INTEGER DEFAULT 0,       -- 最终是否删除
+    triggers    TEXT,                    -- 触发重新检查的原因（空=免AI额度）
+    created_at  DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_verdict_log_chat
+    ON verdict_log(chat_id, created_at);
+
 -- 被丢弃的消息（诊断用，回答"为什么这条没被处理"）
 CREATE TABLE IF NOT EXISTS dropped_messages (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -330,6 +350,34 @@ def _migrate(conn: sqlite3.Connection) -> None:
                 logger.info("迁移：%s 新增列 %s", table, name)
 
 
+# 所有应该存在的表。启动时自检用——
+# 背景：schema 里的 CREATE TABLE IF NOT EXISTS 只在启动时执行，如果容器
+# 没有真正重启（docker compose up -d 在配置未变时可能不重建容器），
+# 新加的表就不会被创建，而调用方只是静默失败（被 except 吞掉），
+# 表现为"功能上线了但数据是空的"，很难发现。线上确实踩到过这一点。
+REQUIRED_TABLES = (
+    "chats", "chat_admins", "users", "messages", "spam_records",
+    "chat_settings", "spam_whitelist", "spam_blacklist", "spam_patterns",
+    "chat_fewshots", "spam_reports", "daily_report_stats", "token_usage",
+    "report_usage", "dropped_messages", "preview_fingerprints",
+    "preview_senders", "global_blacklist", "verdict_log",
+)
+
+
+def verify_schema(path: str) -> list[str]:
+    """返回缺失的表名列表。空列表 = 结构完整。
+
+    这个自检的价值在于把"静默缺表"变成启动日志里的一行明确告警。
+    """
+    conn = sqlite3.connect(path, timeout=DB_TIMEOUT)
+    try:
+        have = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+    finally:
+        conn.close()
+    return [t for t in REQUIRED_TABLES if t not in have]
+
+
 def init_db(path: str) -> None:
     """建库。必须在任何连接之前调用一次。"""
     global _db_path
@@ -346,6 +394,16 @@ def init_db(path: str) -> None:
             logger.info("数据库就绪（WAL 模式）: %s", path)
     finally:
         conn.close()
+
+    # 建表后立即自检。缺表说明 SCHEMA 与代码不一致（或迁移没跑到），
+    # 必须显式喊出来，不能让它变成静默失败。
+    missing = verify_schema(path)
+    if missing:
+        logger.error("数据库结构不完整，缺少表: %s —— "
+                     "相关功能会静默失效，请检查 SCHEMA 与容器是否真正重启",
+                     "、".join(missing))
+    else:
+        logger.info("数据库结构自检通过（%d 张表）", len(REQUIRED_TABLES))
 
 
 def _conn() -> sqlite3.Connection:
@@ -786,6 +844,105 @@ def recent_spam_records(chat_id: int, limit: int = 10) -> list[sqlite3.Row]:
 
 def get_spam_record(record_id: int):
     return query_one("SELECT * FROM spam_records WHERE id=?", (record_id,))
+
+
+def log_verdict(chat_id: int, message_id: int, user_id: int,
+                confidence: float | None, source: str, deleted: bool,
+                triggers: str = "") -> None:
+    """记录一次判定（无论删还是留）。
+
+    这是分布漂移监控的数据基础：只有把"判为正常"的样本也存下来，
+    才能看到置信度分布的真实形状。
+    """
+    execute("""INSERT INTO verdict_log
+        (chat_id, message_id, user_id, confidence, source, deleted, triggers)
+        VALUES (?,?,?,?,?,?,?)""",
+        (chat_id, message_id, user_id, confidence, source,
+         1 if deleted else 0, triggers))
+
+
+def prune_verdict_log(days: int = 30) -> int:
+    """清理过旧的判定记录，避免无限增长。"""
+    with tx() as conn:
+        cur = conn.execute("DELETE FROM verdict_log WHERE created_at < datetime('now', ?)",
+                           (f"-{days} days",))
+        return cur.rowcount
+
+
+def verdict_health(chat_id: int = 0, hours: int = 24) -> dict:
+    """判定健康度：预测分布 + 语料倾斜 + 人工推翻率。
+
+    设计依据（Gmail 垃圾邮件分类器故障 / 阈值漂移监控）：
+    阈值漂移往往发生在**模型本身没变**的情况下——用户行为或广告手法的
+    分布变了，原本合适的阈值就突然不合适了，表现为"误报机器"。
+    文章给出的三个可落地信号：
+      1. **预测分布**：稳定时呈双峰（低分区正常、高分区广告）。
+         中间区间（0.3-0.7）样本比例**突然上升**是漂移的早期信号。
+      2. **语料倾斜**：正负样本比例失衡（贝叶斯机器人就栽在这里）。
+      3. **业务指标**：用户把误删消息"恢复"回来的比例——
+         这正是我们的 revive 动作，是最直接的用户不满信号。
+    """
+    where = ["created_at >= datetime('now', ?)"]
+    args: list = [f"-{hours} hours"]
+    if chat_id:
+        where.append("chat_id = ?")
+        args.append(chat_id)
+    clause = " AND ".join(where)
+
+    # 预测分布：用 verdict_log（含判为正常的样本）。
+    # 必须用这张表——spam_records 只记删除，用它做分布分析是幸存者偏差，
+    # 低分区永远为空，看不到真实形状。
+    vwhere = ["created_at >= datetime('now', ?)", "source='llm'"]
+    vargs: list = [f"-{hours} hours"]
+    if chat_id:
+        vwhere.append("chat_id = ?")
+        vargs.append(chat_id)
+    buckets = {"low(<0.3)": 0, "mid(0.3-0.7)": 0, "high(>0.7)": 0,
+               "very_high(>0.9)": 0}
+    for r in query(f"""SELECT confidence FROM verdict_log
+                       WHERE {' AND '.join(vwhere)}
+                         AND confidence IS NOT NULL""", tuple(vargs)):
+        c = r["confidence"] or 0
+        if c < 0.3:
+            buckets["low(<0.3)"] += 1
+        elif c <= 0.7:
+            buckets["mid(0.3-0.7)"] += 1
+        elif c <= 0.9:
+            buckets["high(>0.7)"] += 1
+        else:
+            buckets["very_high(>0.9)"] += 1
+    llm_total = sum(buckets.values())
+
+    # 人工推翻率：删除后被恢复的比例，最直接的用户不满信号
+    row = query_one(f"""
+        SELECT SUM(CASE WHEN action='delete' THEN 1 ELSE 0 END) d,
+               SUM(CASE WHEN action='revive' THEN 1 ELSE 0 END) r
+        FROM spam_records WHERE {clause}
+    """, tuple(args))
+    d, r = (row["d"] or 0), (row["r"] or 0)
+
+    # 语料倾斜
+    spam_n = query_one(f"""SELECT COUNT(*) n FROM spam_records
+        WHERE {clause} AND action='delete' AND text_snapshot IS NOT NULL""",
+        tuple(args))["n"]
+    mwhere = ["timestamp >= datetime('now', ?)"]
+    margs: list = [f"-{hours} hours"]
+    if chat_id:
+        mwhere.append("chat_id = ?")
+        margs.append(chat_id)
+    ham_n = query_one(f"""SELECT COUNT(*) n FROM messages m
+        WHERE {' AND '.join(mwhere)}
+          AND NOT EXISTS (SELECT 1 FROM spam_records s
+              WHERE s.chat_id=m.chat_id AND s.message_id=m.message_id
+                AND s.action='delete')""", tuple(margs))["n"]
+
+    return {
+        "buckets": buckets, "llm_total": llm_total,
+        "deleted": d, "revived": r,
+        "revive_rate": (r / d) if d else 0.0,
+        "spam_n": spam_n, "ham_n": ham_n,
+        "skew": (spam_n / ham_n) if ham_n else float("inf"),
+    }
 
 
 def audit_window(chat_id: int = 0, hours: int = 24, decisions: int = 0,
