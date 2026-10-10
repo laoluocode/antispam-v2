@@ -31,6 +31,7 @@ from deepseek import DeepSeekClient, DeepSeekError, estimate_cost_yuan
 from detector_rules import (
     INVISIBLE_MIN_LENGTH,
     INVISIBLE_RATIO_THRESHOLD,
+    check_account_profile,
     check_bare_letter_spam,
     check_external_channel_link,
     check_inline_buttons,
@@ -259,6 +260,17 @@ class ChatPipeline:
                                     msg.message_id, msg.user_id, 1.0,
                                     "local_rule", True, ",".join(msg.triggers))
             return Verdict(msg, True, 1.0, "local_rule", v.reason)
+
+        # --- 账号资料检测（昵称即广告位）---
+        # 放在内容规则之后：内容规则更确定（联系方式本体不会误伤），
+        # 资料规则的覆盖更广但依赖昵称习惯。
+        pv = check_account_profile(msg.full_name)
+        if pv.hit:
+            await asyncio.to_thread(db.mark_checked, [msg.row_id])
+            await asyncio.to_thread(db.log_verdict, self.chat_id,
+                                    msg.message_id, msg.user_id, 1.0,
+                                    "local_rule", True, "账号资料")
+            return Verdict(msg, True, 1.0, "local_rule", pv.reason)
 
         # --- 自进化规则（已毕业的直拦）---
         # 这些规则通过了"负样本零命中"闸门与 shadow 观察期，才有资格直拦。

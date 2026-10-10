@@ -860,6 +860,45 @@ async def main():
           % crow2["linked_chat_id"])
     assert crow2["linked_chat_id"] is None, "未配置时应为 NULL，不放行任何自动转发"
 
+    print("=== 24. 回归：账号资料检测（昵称即广告位）===")
+    # 来源：Discord AutoMod 有 MemberProfile 触发类型（扫描用户资料），
+    # 我们原来完全没检查资料。而广告号把引流指引直接写进昵称——
+    # 正文被删了也照样能被群友找到（"南叙 主页有群"、"屿辰 看我简介"）。
+    #
+    # 实测区分度（522 个有删除记录的账号 / 19 个可信群友）：
+    #   引流指引类命中 33 个广告号（6.3%），可信群友 0 命中
+    #   联系方式类命中 14 个（2.7%），可信群友 0 命中
+    # 误伤为零，符合 L0"只放零误伤模式"的门槛。
+    from detector_rules import check_account_profile
+
+    spam_names = [
+        "南叙 主页有群", "祁野 看我资料", "简寻 看我资料", "屿辰 看我简介",
+        "甜晴天（武汉专业95客服）", "知禾（湖北大学开课🀄️）", "春色与你✨上门6",
+        "白月光唯一客服（新预约号）", "哆哆💘兼职在线", "甜甜 在校壆妹资原",
+    ]
+    for n in spam_names:
+        v = check_account_profile(n)
+        assert v.hit, "广告号昵称应命中: %r" % n
+    print("  广告号昵称 %d/%d 命中 ✓" % (len(spam_names), len(spam_names)))
+
+    # 这 19 个是**线上真实的可信群友**（发言 >=30 且删除比 <5%），
+    # 必须全部放过——这是零误伤断言的实测依据，不是编的。
+    trusted_names = [
+        "富顺富顺", "Rick superlucky", "嘿嘿 嘿", "肯恰那", "吉米",
+        "独木不成林", "汤姆", "灰狼", "溪口水库", "小灰机潜海",
+        "summonkings", "夸克 刘", "锦鲤附体", "蓝脸的盗耳礅", "梅丹丹死了",
+        "解 药（🈚️痔疮）", "星哥", "双叶 | 16:26", "威 常",
+    ]
+    fp = [n for n in trusted_names if check_account_profile(n).hit]
+    print("  线上真实可信群友 %d 个，误伤 %d 个 %s"
+          % (len(trusted_names), len(fp), fp or "✓"))
+    assert not fp, "可信群友昵称不该命中: %s" % fp
+
+    # 空昵称不应崩
+    for empty in (None, "", "   "):
+        assert not check_account_profile(empty).hit
+    print("  空昵称安全处理 ✓")
+
     os.unlink(tmp)
     print("\n全部通过")
 
