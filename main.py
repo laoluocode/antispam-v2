@@ -1430,7 +1430,7 @@ async def job_self_evolve(context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if total_promoted:
         # 规则库变了，强制重载让 L0 立刻用上
-        await asyncio.to_thread(load_patterns, True)
+        await asyncio.to_thread(load_patterns, None, True)
         lines = [f"🧬 自进化：新毕业 {len(total_promoted)} 条直拦规则"]
         for cid, pat in total_promoted[:10]:
             row = await asyncio.to_thread(db.get_chat, cid)

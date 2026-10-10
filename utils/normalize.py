@@ -91,6 +91,10 @@ _REPLACEMENT_MAP = {
 # 噪声：空白与所有非单词字符（含 emoji、标点、符号）
 _NOISE_PATTERN = re.compile(r"[\s\W_]+", re.UNICODE)
 
+# 汉字之间夹的单字母缓冲：叚i钞 -> 叚钞。
+# 零宽断言（不消费左右字符）是关键，理由见 normalize() 的注释。
+_BUFFER_PATTERN = re.compile(r"(?<=[\u4e00-\u9fff])[iIl1](?=[\u4e00-\u9fff])")
+
 
 def strip_invisibles(text: str) -> str:
     """去掉零宽字符与变体选择符，保留其余字面。
@@ -101,15 +105,8 @@ def strip_invisibles(text: str) -> str:
     return _INVISIBLE_PATTERN.sub("", text or "")
 
 
-def normalize(text: str) -> str:
-    """完整归一化：去不可见字符 -> 小写 -> emoji/谐音替换 -> 去字母缓冲 -> 去噪声。
-
-    结果用于模糊匹配。示例：
-        "叚i钞"    -> "假钞" 前体（"叚" 由调用方另行映射）
-        "上 门"    -> "上门"
-        "無定 面付" -> "无定面付"
-        "🉑丄 門"  -> "可上门"
-    """
+def _normalize_pass(text: str) -> str:
+    """一趟归一化。不要直接调用——用 normalize()。"""
     t = strip_invisibles(text or "").lower()
 
     # 全角数字先归一到半角，否则手机号/金额等 ASCII 模式会被绕过
@@ -123,17 +120,39 @@ def normalize(text: str) -> str:
     for src, dst in _REPLACEMENT_MAP.items():
         t = t.replace(src.lower(), dst)
 
-    # 去掉汉字之间夹的单字母/单数字缓冲：叚i钞 -> 叚钞
-    t = re.sub(
-        r"([\u4e00-\u9fff]?)([iIl1])([\u4e00-\u9fff]?)",
-        lambda m: m.group(1) + m.group(3) if (m.group(1) or m.group(3)) else m.group(2),
-        t,
-    )
+    # 去掉汉字之间夹的单字母/单数字缓冲：叚i钞 -> 叚钞。
+    # 用**零宽断言**而不是捕获组：捕获组会消费左右字符，导致
+    # '洗m1挣' 里的 '1' 因为左边的 'm' 被消费掉而漏掉。
+    t = _BUFFER_PATTERN.sub("", t)
 
     # 去掉汉字之间的空格，使跨空格关键词可以匹配：上 门 -> 上门
     t = re.sub(r"([\u4e00-\u9fff])\s+([\u4e00-\u9fff])", r"\1\2", t)
 
     return _NOISE_PATTERN.sub("", t)
+
+
+# 归一化最多迭代几轮。实测 2 轮足够收敛（绝大多数 1 轮）。
+_NORMALIZE_MAX_PASSES = 3
+
+
+def normalize(text: str) -> str:
+    """完整归一化，**保证幂等**。
+
+    幂等很重要：广告号靠"多插一个缓冲字符"制造变体，
+    如果 normalize('来洗mi 挣一万') 与 normalize('来洗m1挣一万') 得到不同结果，
+    同一条广告就有了两种指纹，规则、判定记忆、预览指纹都会各算一份。
+
+    单趟变换做不到幂等——替换表把 i 变成 1 之后，
+    原先"字母夹在汉字间"的判断条件会变（'mi 挣' 变成 'm1 挣'），
+    需要再走一趟才能收敛。所以这里迭代到不动点，最多 _NORMALIZE_MAX_PASSES 轮。
+    """
+    cur = _normalize_pass(text or "")
+    for _ in range(_NORMALIZE_MAX_PASSES - 1):
+        nxt = _normalize_pass(cur)
+        if nxt == cur:
+            break
+        cur = nxt
+    return cur
 
 
 def invisible_ratio(text: str) -> float:

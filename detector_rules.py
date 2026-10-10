@@ -355,47 +355,66 @@ def check_inline_buttons(button_texts: list[str],
 # ---------------------------------------------------------------------------
 
 # 规则缓存。学习任务写完库后由 pipeline 触发 force 重载。
-_pattern_cache: list = []
+# 规则缓存：按群分开存，因为同一 pattern 在不同群是独立的一行
+# （spam_patterns 的主键是 UNIQUE(chat_id, pattern)）。
+# 早先用一个扁平列表存全部群的规则，导致"哪条规则属于哪个群"这个信息丢失，
+# 进而让 bump_pattern 无法定位到正确的行（见 db.bump_pattern 的注释）。
+_pattern_cache: dict[int | None, list] = {}
 _pattern_cache_at = 0.0
 PATTERN_CACHE_TTL = 300.0
 
 
-def load_patterns(force: bool = False) -> list:
-    """从库里加载自进化规则到缓存。返回 [(pattern, kind, hits), ...]。
+def load_patterns(chat_id: int | None = None,
+                  force: bool = False) -> list:
+    """加载某个群的自进化规则。返回 [(pattern, mode, hits), ...]。
 
-    active 规则用于 L0 直拦（0ms 删除）；shadow 规则在判定时并行记录命中，
+    active 规则用于 L0 直拦（0ms 删除）；shadow 规则在判定时并行记录命中、
     不影响决定——这是"先观察再放权"的安全阀。
+
+    chat_id 为 None 时返回全部群的规则（运维查看用，不该用于判定）。
     """
     global _pattern_cache, _pattern_cache_at
     now = time.time()
     if not force and now - _pattern_cache_at < PATTERN_CACHE_TTL:
-        return _pattern_cache
-    # 直接 import db，不要写 "try: from database ... except ImportError" 的回退：
-    # `database` 是老 bot 的模块（另一个 schema），在容器里 import 会**成功**
-    # （不触发 ImportError），于是拿它查 spam_patterns 必然失败并被 except 吞掉，
-    # 静默返回空缓存——自进化规则曾因此从上线起就没被加载过。
+        if chat_id in _pattern_cache:
+            return _pattern_cache[chat_id]
+
     try:
         import db as _db
     except ImportError:
-        _db = None
-    if _db is None:
         logger.error("无法加载规则库模块，自进化规则不可用")
-        return _pattern_cache
+        return _pattern_cache.get(chat_id, [])
 
     try:
-        active = [(r["pattern"], "active", r["hit_count"] or 0)
-                  for r in _db.active_patterns()]
-        shadow = [(r["pattern"], "shadow", r["shadow_hits"] or 0)
-                  for r in _db.patterns_for_shadow()]
-        _pattern_cache = active + shadow
-        _pattern_cache_at = now
+        entries: list[tuple] = []      # (pattern, mode, hits, owner_chat)
+        for r in _db.active_patterns():
+            entries.append((r["pattern"], "active", r["hit_count"] or 0,
+                            r["chat_id"]))
+        for r in _db.patterns_for_shadow():
+            entries.append((r["pattern"], "shadow", r["shadow_hits"] or 0,
+                            r["chat_id"]))
     except Exception as exc:  # noqa: BLE001
         # 不能静默：加载失败意味着自进化完全失效，必须看得见
         logger.error("加载自进化规则失败: %s: %s", type(exc).__name__, exc)
-    return _pattern_cache
+        return _pattern_cache.get(chat_id, [])
+
+    # 按群分桶。全局规则（chat_id IS NULL）对所有群生效。
+    buckets: dict[int | None, list] = {}
+    for pattern, mode, hits, owner in entries:
+        if owner is None:
+            for key in {chat_id} if chat_id is not None else {None}:
+                buckets.setdefault(key, []).append((pattern, mode, hits))
+        else:
+            buckets.setdefault(owner, []).append((pattern, mode, hits))
+    # None 这个键表示"跨群视图"，用于运维
+    buckets[None] = [(p, m, h) for p, m, h, _o in entries]
+
+    _pattern_cache = buckets
+    _pattern_cache_at = now
+    return _pattern_cache.get(chat_id, [])
 
 
-def check_learned_patterns(text: str) -> Verdict:
+def check_learned_patterns(text: str, chat_id: int | None = None) -> Verdict:
     """用**已毕业**（active）的自进化规则做 L0 直拦。
 
     这些规则经过了"负样本零命中"闸门与 shadow 观察期，才有资格直拦。
@@ -405,7 +424,7 @@ def check_learned_patterns(text: str) -> Verdict:
     if not t:
         return _NO_HIT
     norm = normalize(t)
-    for pattern, mode, _hits in load_patterns():
+    for pattern, mode, _hits in load_patterns(chat_id):
         if mode != "active":
             continue
         if _pattern_matches(pattern, t, norm):
@@ -418,7 +437,13 @@ def _pattern_matches(pattern: str, raw: str, norm: str) -> bool:
 
     · 行为类（`__invisible_ratio__` 等）走专门的判定
     · 域类（t.me/xxx、example.com）在原文与归一化文本里找
-    · 其余（签名/短语）在归一化文本里找——签名与短语都是归一化后的形态
+    · 其余（签名/短语）在**归一化文本**里找
+
+    ⚠️ 签名/短语类必须把 pattern 也归一化再比。挖掘时存的是 normalize 后的
+    形态，但 `db.add_pattern` 可能被手工传入原文，而 `_pattern_matches` 拿
+    归一化后的 norm 去比——不归一化 pattern 就会永远匹配不到。
+    实测踩到：毕业后的规则 `check_learned_patterns` 恒为 False，
+    即**自进化学到的规则实际拦不住东西**。
     """
     if pattern == "__invisible_ratio__":
         return len(raw) >= INVISIBLE_MIN_LENGTH and \
@@ -427,10 +452,12 @@ def _pattern_matches(pattern: str, raw: str, norm: str) -> bool:
         return is_bare_letter(raw)
     if pattern.startswith("t.me/") or _DOMAIN_LIKE.match(pattern):
         return pattern in raw.lower() or pattern in norm
-    return pattern and pattern in norm
+    pnorm = normalize(pattern)
+    return bool(pnorm) and pnorm in norm
 
 
-def record_shadow_hits(text: str, is_spam: bool) -> list[str]:
+def record_shadow_hits(text: str, is_spam: bool,
+                       chat_id: int | None = None) -> list[str]:
     """记录 shadow 规则在本条消息上的命中情况。
 
     返回命中的规则列表。**只在真值已知时调用**（例如 LLM 判完之后），
@@ -441,7 +468,7 @@ def record_shadow_hits(text: str, is_spam: bool) -> list[str]:
         return []
     norm = normalize(t)
     hits = []
-    for pattern, mode, _hits in load_patterns():
+    for pattern, mode, _hits in load_patterns(chat_id):
         if mode != "shadow":
             continue
         if _pattern_matches(pattern, t, norm):
@@ -450,9 +477,12 @@ def record_shadow_hits(text: str, is_spam: bool) -> list[str]:
         from db import bump_pattern
         for pattern in hits:
             try:
-                bump_pattern(pattern, shadow_hit=True, spam_hit=is_spam)
-            except Exception:  # noqa: BLE001
-                pass
+                # 必须带上 chat_id：否则一次观测会写进所有群的同名行，
+                # 破坏"在本群零误命中"这个毕业前提
+                bump_pattern(pattern, shadow_hit=True, spam_hit=is_spam,
+                             chat_id=chat_id)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("累加规则命中失败 pattern=%r: %s", pattern, exc)
     return hits
 
 

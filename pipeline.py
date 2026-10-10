@@ -228,7 +228,8 @@ class ChatPipeline:
         # 漏掉这一步会让 shadow 规则永远攒不够毕业所需的命中数——
         # 越是规则能抓的广告，越不给规则贡献证据，形成自我阻碍。
         try:
-            await asyncio.to_thread(record_shadow_hits, msg.text, True)
+            await asyncio.to_thread(record_shadow_hits, msg.text, True,
+                                    self.chat_id)
         except Exception as exc:  # noqa: BLE001
             logger.warning("记录 shadow 命中失败: %s", exc)
         return Verdict(msg, True, confidence, source, reason)
@@ -299,7 +300,7 @@ class ChatPipeline:
             return await self._hit(msg, pv.reason)
 
         # 自进化规则：通过"负样本零命中"闸门与 shadow 观察期后才允许直拦
-        lv = check_learned_patterns(msg.text)
+        lv = check_learned_patterns(msg.text, self.chat_id)
         if lv.hit:
             return await self._hit(msg, lv.reason, source="learned")
 
@@ -516,9 +517,10 @@ class ChatPipeline:
         scores = {int(v["id"]): float(v.get("confidence", 0.0))
                   for v in parsed.get("verdicts", [])
                   if "id" in v}
-        # 判定阈值。放在这里是因为下面的 shadow 统计与后续分级都要用，
-        # 早先定义在分级处会把 shadow 记录变成 NameError。
+        # 判定阈值与影子模式都要在这里定：下面的 shadow 统计、判定记录、
+        # 以及分级都要用。早先 cut 定义在分级处，导致 shadow 记录 NameError。
         cut = float(cfg.get("confidence_cut", 0.5))
+        shadow = bool(cfg.get("shadow_mode", 1))
         # 记录 shadow 规则命中（此时每条的真值已知，可用于统计准确率）。
         # 这是"先观察再放权"的关键：shadow 规则不影响决定，只积累证据。
         for m in batch:
@@ -527,7 +529,7 @@ class ChatPipeline:
                 continue
             try:
                 await asyncio.to_thread(
-                    record_shadow_hits, m.text, conf >= cut)
+                    record_shadow_hits, m.text, conf >= cut, self.chat_id)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -538,9 +540,16 @@ class ChatPipeline:
             if conf is None:
                 continue
             try:
+                # deleted 必须反映**实际是否删除**，不能直接用 conf >= cut：
+                #   · 付费商家的阈值更高（ADVERTISER_CUT）
+                #   · 波次期间阈值收紧
+                #   · 影子模式根本不删
+                # 早先这里用裸 cut，实测三种情况都会写错值（见 review）。
+                # 这一列是审计事实，写错就是数据缺陷。
+                actually_deleted = (not shadow) and conf >= self._delete_threshold(m, cut)
                 await asyncio.to_thread(
                     db.log_verdict, self.chat_id, m.message_id, m.user_id,
-                    conf, "llm", conf >= cut,
+                    conf, "llm", actually_deleted,
                     ",".join(m.triggers))
             except Exception:  # noqa: BLE001
                 pass
@@ -568,8 +577,6 @@ class ChatPipeline:
             if keep:
                 await asyncio.to_thread(
                     self._requeue, [m for m in missing if m.row_id in set(keep)])
-
-        shadow = bool(cfg.get("shadow_mode", 1))
 
         verdicts: list[Verdict] = []
         for m in batch:

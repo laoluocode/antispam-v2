@@ -508,31 +508,32 @@ async def main():
 
     # shadow 阶段不应影响判定
     load_patterns(force=True)
-    v = check_learned_patterns("来洗mi 挣一万")
+    v = check_learned_patterns("来洗mi 挣一万", cid8)
     print("  shadow 规则是否直接拦截: %s (应为 False，观察期内不决定)"
           % v.hit)
     assert not v.hit, "shadow 规则不应直拦"
 
     # 记录 shadow 命中（模拟 LLM 判完）
-    hits = record_shadow_hits("来洗mi 挣一万", is_spam=True)
+    hits = record_shadow_hits("来洗mi 挣一万", is_spam=True, chat_id=cid8)
     print("  record_shadow_hits 命中: %s" % [h[:20] for h in hits])
     assert hits, "应记录到 shadow 命中"
 
-    # 攒够观察期 -> 毕业
+    # 攒够观察期 -> 毕业（必须带 chat_id，统计是按群的）
     for r in db.patterns_for_shadow():
         for _ in range(12):
-            db.bump_pattern(r["pattern"], shadow_hit=True, spam_hit=True)
+            db.bump_pattern(r["pattern"], shadow_hit=True, spam_hit=True,
+                            chat_id=cid8)
     eligible = learner.eligible_for_promotion(cid8)
     print("  可毕业 %d 条" % len(eligible))
     promoted = learner.run_lifecycle(cid8)["promoted"]
     print("  已毕业: %s" % [p[:24] for p in promoted])
     load_patterns(force=True)
-    v = check_learned_patterns("来洗mi 挣一万")
+    v = check_learned_patterns("来洗mi 挣一万", cid8)
     print("  毕业后直拦: %s (%s)" % (v.hit, v.reason))
     assert v.hit, "毕业后应在 L0 直拦"
 
     # 正常消息不应被自进化规则命中
-    fp = [t for t in HAM if check_learned_patterns(t).hit]
+    fp = [t for t in HAM if check_learned_patterns(t, cid8).hit]
     print("  正常语料误伤: %s (应为空)" % fp)
     assert not fp, "自进化规则不该命中正常语料"
 
@@ -1064,7 +1065,8 @@ async def main():
 
     # 攒够后应能毕业
     for _ in range(12):
-        db.bump_pattern("特价液课", shadow_hit=True, spam_hit=True)
+        db.bump_pattern("特价液课", shadow_hit=True, spam_hit=True,
+                        chat_id=cidS)
     from learner import eligible_for_promotion
     elig = eligible_for_promotion(cidS)
     print("  攒够命中后可毕业: %s" % [r["pattern"] for r in elig])
@@ -1073,7 +1075,8 @@ async def main():
     # 反向：有误命中的规则不能毕业（闸门仍然有效）
     db.add_pattern(cidS, "武汉养生", mode="shadow")
     for _ in range(12):
-        db.bump_pattern("武汉养生", shadow_hit=True, spam_hit=False)  # 有误命中
+        db.bump_pattern("武汉养生", shadow_hit=True, spam_hit=False,
+                        chat_id=cidS)  # 有误命中
     elig2 = eligible_for_promotion(cidS)
     names = [r["pattern"] for r in elig2]
     print("  有误命中的规则是否可毕业: %s（应不含 武汉养生）"
@@ -1181,6 +1184,98 @@ async def main():
     print("  (c) 纯引导文案按钮 -> 判定=%s reason=%s"
           % ("删除" if (v3 and v3.is_spam) else "放过", v3.reason if v3 else ""))
     assert v3 and v3.is_spam, "广告引导按钮应被判删"
+
+    print("=== 30. 回归：同 pattern 在不同群必须有独立统计（发现于 code review）===")
+    # review 发现：spam_patterns 的主键是 UNIQUE(chat_id, pattern)，
+    # 但 bump_pattern 只用 WHERE pattern=? —— 一次观测写进**所有群**的同名行。
+    # 线上实证：7 个 pattern 跨群重名，计数器逐位相同（hits=[20,20]）。
+    #
+    # 这破坏的是毕业闸门的前提：条件是"该规则**在本群**观察期内零误命中"，
+    # 串扰后退化成"全局聚合零误命中"——一个群可以凭别群的证据毕业，
+    # 在自己从未验证过该 pattern 的情况下开始直删本群消息。
+    from detector_rules import load_patterns, record_shadow_hits
+
+    ca, cb = -1001, -1002
+    for cid in (ca, cb):
+        db.register_chat(cid, "群%d" % cid, "general", shadow_mode=False)
+        db.set_chat_field(cid, "shadow_mode", 0)
+
+    # 两个群各有一条同名规则
+    db.add_pattern(ca, "跨群同名测试规则", mode="shadow")
+    db.add_pattern(cb, "跨群同名测试规则", mode="shadow")
+    db.execute("UPDATE spam_patterns SET hit_count=0, shadow_hits=0, "
+               "shadow_spam_hits=0")
+
+    # 只让 A 群观测到一次命中
+    hits = record_shadow_hits("跨群同名测试规则内容", True, ca)
+    print("  在 A 群记录一次命中 -> %s" % hits)
+    assert hits, "A 群应命中该规则"
+
+    rows = {r["chat_id"]: (r["shadow_hits"], r["shadow_spam_hits"])
+            for r in db.query("""SELECT chat_id, shadow_hits, shadow_spam_hits
+                                 FROM spam_patterns
+                                 WHERE pattern='跨群同名测试规则'""")}
+    print("  两群统计: A=%s  B=%s" % (rows.get(ca), rows.get(cb)))
+    assert rows[ca] == (1, 1), "A 群应计 1 次"
+    assert rows[cb] == (0, 0), \
+        "B 群不该被动累加（原实现两群会同时变成 1，破坏按群验证的前提）"
+    print("  ✓ 统计按群隔离，B 群未被串扰")
+
+    # 缓存也要按群隔离：B 群不该看到 A 群的规则
+    load_patterns(force=True)
+    a_pats = [p[0] for p in load_patterns(ca)]
+    b_pats = [p[0] for p in load_patterns(cb)]
+    print("  A 群可见规则数=%d  B 群可见规则数=%d（两群各有自己那条同名规则）"
+          % (len(a_pats), len(b_pats)))
+    assert "跨群同名测试规则" in a_pats and "跨群同名测试规则" in b_pats
+    # 关键：B 群的规则条目来自 B 群自己的行，不是 A 群那行
+    b_row = [r for r in db.query("""SELECT chat_id FROM spam_patterns
+                                    WHERE pattern='跨群同名测试规则'""") ]
+    assert {r["chat_id"] for r in b_row} == {ca, cb}
+
+    # 关键：B 群不该因为 A 群的证据而可毕业
+    from learner import eligible_for_promotion
+    elig_b = [r["pattern"] for r in eligible_for_promotion(cb)]
+    print("  B 群可毕业规则: %s（应不含跨群同名——B 群自己零观测）"
+          % (elig_b or "无"))
+    assert "跨群同名测试规则" not in elig_b, \
+        "B 群不能凭 A 群的证据毕业"
+
+    print("=== 31. 回归：normalize 必须幂等（潜在绕过面）===")
+    # 发现过程：毕业后规则 check_learned_patterns 恒为 False。
+    # 根因是 normalize 不幂等：
+    #   normalize('来洗mi 挣一万') = '来洗m1挣一万'
+    #   normalize('来洗m1挣一万')  = '来洗m挣一万'    <- 同一句话两种指纹
+    #
+    # 为什么是绕过面：广告号只要多插一个缓冲字符就能制造"另一种写法"，
+    # 而规则、判定记忆、预览指纹都按归一化结果做键——同一句话各算一份。
+    # 单趟变换做不到幂等（替换表把 i 变成 1 之后，
+    # "字母夹在汉字间"的判断条件就变了），所以改成迭代到不动点。
+    from utils.normalize import normalize
+
+    idem = ["来洗mi 挣一万", "来洗m1挣一万", "洗mi挣", "上i门", "上 门",
+            "ok", "1", "签到", "叚i钞", "🉑丄 門", "無定 面付",
+            "能收🧧就行，曰5K", "无-押小额口苓红包洗资"]
+    bad = []
+    for t in idem:
+        if normalize(t) != normalize(normalize(t)):
+            bad.append(t)
+    print("  幂等性: %d/%d 通过%s"
+          % (len(idem) - len(bad), len(idem), "" if not bad else "  失败: %s" % bad))
+    assert not bad, "normalize 必须幂等，否则同一句话会有多个指纹: %s" % bad
+
+    # 关键等价性：同一条广告的不同写法必须归一到同一结果
+    groups = [
+        (["来洗mi 挣一万", "来洗m1挣一万", "来洗mi挣一万"], "字母缓冲变体"),
+        (["上 门", "上门", "上i门", "上1门"], "空格与缓冲变体"),
+        (["無定 面付", "无定面付"], "繁体与空格"),
+    ]
+    for group, note in groups:
+        norms = {normalize(x) for x in group}
+        print("  %-14s %s -> %s" % (note, group[:2], norms))
+        assert len(norms) == 1, \
+            "%s 应归一到同一结果，实际 %s" % (note, norms)
+    print("  ✓ 变体归一一致")
 
     os.unlink(tmp)
     print("\n全部通过")

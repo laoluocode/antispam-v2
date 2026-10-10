@@ -1578,13 +1578,39 @@ def _refresh_local_pattern_cache() -> None:
         logger.warning("刷新本进程规则缓存失败: %s", exc)
 
 
-def bump_pattern(pattern: str, shadow_hit: bool, spam_hit: bool) -> None:
+def bump_pattern(pattern: str, shadow_hit: bool, spam_hit: bool,
+                 chat_id: int | None = None) -> None:
+    """累加某条规则的命中统计。
+
+    **必须限定 chat_id。** 主键是 UNIQUE(chat_id, pattern)，同一个 pattern
+    可能在多个群各有一行；不加限定的 `WHERE pattern=?` 会让一次观测写进
+    所有群，实测两个群的计数器逐位相同（hits=[20,20]）。
+
+    这破坏的不是美观而是**闸门的前提**：毕业条件是"该规则**在本群**观察期内
+    零误命中"，串扰后退化成"全局聚合零误命中"——一个群可以凭别群的证据毕业，
+    在自己从未验证过该 pattern 的情况下开始直删本群消息。
+
+    chat_id 为 None 时只更新全局行（chat_id IS NULL）；调用方拿不到群时
+    （例如运维手工 bump）才应省略。
+    """
+    if chat_id is None:
+        # 不传群时更新**所有**同名行。
+        # 早先这里只更新 chat_id IS NULL 的行——而实际上没有全局规则
+        # （全部由 refresh_candidates 按群创建），于是这个分支变成静默无操作，
+        # 让调用方以为计数成功。运维手工 bump 和测试都踩过。
+        execute("""UPDATE spam_patterns
+                   SET hit_count = hit_count + 1,
+                       shadow_hits = shadow_hits + ?,
+                       shadow_spam_hits = shadow_spam_hits + ?
+                   WHERE pattern=?""",
+                (1 if shadow_hit else 0, 1 if spam_hit else 0, pattern))
+        return
     execute("""UPDATE spam_patterns
                SET hit_count = hit_count + 1,
                    shadow_hits = shadow_hits + ?,
                    shadow_spam_hits = shadow_spam_hits + ?
-               WHERE pattern=?""",
-            (1 if shadow_hit else 0, 1 if spam_hit else 0, pattern))
+               WHERE pattern=? AND chat_id=?""",
+            (1 if shadow_hit else 0, 1 if spam_hit else 0, pattern, chat_id))
 
 
 def promote_pattern(pattern_id: int) -> None:
