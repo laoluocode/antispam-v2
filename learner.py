@@ -96,6 +96,17 @@ CORPUS_LIMIT = 20000
 # 闸门的可靠性下降，此时跳过本轮学习并告警。
 MIN_HAM_PER_SPAM = 0.5
 
+# 负样本的**绝对条数**下限，与比值门槛同时生效（取更严的那个）。
+#
+# 为什么光有比值不够：实测（code review 的 Spec 轴）发现某群的负样本
+# 池只有 35 条、比值 0.075 仍然产出过规则，而那 35 条里**15% 其实是广告**
+# （该群高达 67%）——"正常语料"实际是 `'外绌，接課'`、`'特嫁夜'` 这类脱敏广告。
+# 闸门证明的是"不命中我们**误标为正常**的广告"，样本太小时这个证明没有意义。
+#
+# 200 条的依据：按实测 15% 的假阴性率，200 条里约 30 条是广告噪音；
+# 而规则要在这样的语料上零命中，才谈得上"边界清楚"。
+MIN_HAM_ABSOLUTE = 200
+
 # 候选短语长度范围（归一化后）
 MIN_PHRASE_LEN = 4
 MAX_PHRASE_LEN = 24
@@ -377,13 +388,20 @@ def refresh_candidates(chat_id: int) -> dict:
     # 借鉴 @BayesSpamSniperBot 的上线故障（训练集广告远多于正常消息，
     # 分类器学成"倾向判广告"，上线后大规模误删）。宁可不学，也不在证据不足时放权。
     ratio = len(ham) / max(1, len(spam))
-    if ratio < MIN_HAM_PER_SPAM:
+    if ratio < MIN_HAM_PER_SPAM or len(ham) < MIN_HAM_ABSOLUTE:
+        why = []
+        if ratio < MIN_HAM_PER_SPAM:
+            why.append("比值 %.2f < %.2f" % (ratio, MIN_HAM_PER_SPAM))
+        if len(ham) < MIN_HAM_ABSOLUTE:
+            why.append("绝对条数 %d < %d" % (len(ham), MIN_HAM_ABSOLUTE))
         logger.warning(
-            "正常语料饥饿 chat=%s spam=%d ham=%d 比值=%.2f < %.2f —— "
+            "正常语料不足 chat=%s spam=%d ham=%d（%s）—— "
             "闸门统计意义不足，本轮跳过学习",
-            chat_id, len(spam), len(ham), ratio, MIN_HAM_PER_SPAM)
-        return {"skipped": True, "reason": "正常语料不足（闸门不可靠）",
-                "spam": len(spam), "ham": len(ham), "ratio": round(ratio, 2)}
+            chat_id, len(spam), len(ham), "；".join(why))
+        return {"skipped": True,
+                "reason": "正常语料不足（%s）" % "；".join(why),
+                "spam": len(spam), "ham": len(ham),
+                "ratio": round(ratio, 2)}
 
     cands = mine_all(spam, ham)
     passed = [c for c in cands if c.passes_gate()]

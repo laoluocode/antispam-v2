@@ -601,9 +601,16 @@ def bump_user_deleted(chat_id: int, user_id: int,
 
 
 # 长期干净发言的成员享有多少条"免 AI"额度。
-# 额度耗尽后下一条消息会重新送 AI 复核——这样即使账号被慢慢养熟后变坏，
-# 也最多漏过 GRACE_MESSAGES 条，不会永久失守。
-GRACE_MESSAGES = 30
+#
+# **从 30 降到 5**：实测（code review 的 Spec 轴）这套免检的触发条件
+# 只能覆盖 13% 的真实广告、L0 只能覆盖 15%，所以被盗号的 trusted 用户
+# 发 30 条广告时约 22 条完全绕过所有检查。额度降到 5 把这个暴露面压到
+# 个位数，同时保留"老群友闲聊不必每条送 AI"的收益。
+#
+# 另外要注意：**额度会自我续期**——每条被判干净的消息都会 refresh_grace(reset=True)
+# 重新给满。所以"刷满 30 条后必送 AI"这道保险在实践中几乎不触发；
+# 真正兜底的是"第一次删除就永久取消额度"（del_n > 0 后不再走免检分支）。
+GRACE_MESSAGES = 5
 
 # 额度可刷新的条件：这次送 AI 判定的结果是"干净"
 def refresh_grace(chat_id: int, user_id: int, reset: bool = False) -> None:
@@ -930,6 +937,87 @@ def prune_verdict_log(days: int = 30) -> int:
         return cur.rowcount
 
 
+# 判定记忆的字符下限。
+#
+# **设成 2（只挡单字），因为字符长度不是好的判别维度。** 实测依据：
+#   广告里归一化长度 1-2 的占 13.7%（'🈶🈳🉑⬆️🚪' '有空' '頭颗😛'）
+#   正常消息里 1-2 的占 21.7%（'哈哈' '签到' '哈喽'）
+#   两侧都大量存在，靠长度切不干净。
+# 而把下限提到 5 会挡掉 37.4% 的广告，同时 [3,5) 区间里还有 13 个高频
+# 正常短语（'哈哈哈哈' '今日排行' '储物袋' '今日发言'…）——两头不讨好。
+#
+# 真正做判别的是 _memory_allowed() 的**负样本零命中**闸门：
+# '哈哈哈哈' 这类在正常语料里必然出现，会被它精准挡住；
+# 而 '尾课，上闩' 这类真广告零命中，正常放行。
+# 下限只负责挡掉"单字也能被记住"这种荒唐情况。
+MEMORY_MIN_CHARS = 2
+
+# 判定记忆的有效期（天）。记忆会永久生效，但"这句话是不是广告"
+# 的判断可能过时（群话题会变、当时的尺度也可能偏），所以让它过期。
+MEMORY_TTL_CONFIRMED = 90
+MEMORY_TTL_FALSE_POSITIVE = 365
+
+
+def _memory_allowed(chat_id: int, norm: str, label: str) -> tuple[bool, str]:
+    """决定一条内容能不能进判定记忆。返回 (允许, 原因)。
+
+    **confirmed 必须过"负样本零命中"闸门**——这是规则系统里同一个判据，
+    换个地方用。
+
+    理由：confirmed 记忆会让该内容在**全部群、对所有用户、永久直删**。
+    若记住的是 '哈哈哈哈' 或 '今日排行' 这类群内常用语，就等于永久删掉
+    正常发言。而这类短语在负样本语料（未被删除的消息）里必然出现，
+    所以零命中闸门能精准挡住它们，同时放行 '尾课，上闩' 这种真广告。
+
+    false_positive 不需要这道闸门：它只让内容被放行，方向是安全的。
+
+    实现是"粗筛 + 精判"：SQL 用归一化前缀做 LIKE 粗筛（限制 30 天窗口），
+    再在 Python 里对候选做完整归一化比对。粗筛可能漏（归一化会去掉
+    空格/标点，位偏移与原文不同），所以粗筛只用来**缩小候选集**，
+    判定以精判为准；宁可多取几条候选也不能漏。
+    """
+    if label != "confirmed":
+        return True, ""
+    if len(norm) < MEMORY_MIN_CHARS:
+        return True, ""
+
+    # 粗筛：取归一化后的前 4 个字符，逐字做 LIKE（容忍原文里的分隔字符）。
+    # 例如 norm='尾课上闩' -> 依次匹配含 '尾' 且含 '课' 且含 '上' 且含 '闩' 的消息。
+    # 这样即使原文是 '尾-课 上 闩' 也能被捞出来。
+    chars = [c for c in norm[:4] if c.strip()]
+    if not chars:
+        return True, ""
+    where = " AND ".join("m.text LIKE ?" for _ in chars)
+    rows = query(f"""
+        SELECT m.text FROM messages m
+        WHERE m.chat_id = ? AND m.text IS NOT NULL
+          AND m.timestamp >= datetime('now', '-30 days')
+          AND NOT EXISTS (SELECT 1 FROM spam_records s
+              WHERE s.chat_id = m.chat_id AND s.message_id = m.message_id
+                AND s.action = 'delete')
+          AND {where}
+        LIMIT 200
+    """, (chat_id, *[f"%{c}%" for c in chars]))
+    for r in rows:
+        if norm in normalize_for_hash(r["text"]):
+            return False, "该内容在正常消息语料里出现过，不应记为直删"
+    return True, ""
+
+
+def purge_expired_memory() -> int:
+    """清掉过期的判定记忆。"""
+    with tx() as conn:
+        n = conn.execute("""
+            DELETE FROM verdict_memory
+            WHERE (label='confirmed'
+                   AND created_at < datetime('now', ?))
+               OR (label='false_positive'
+                   AND created_at < datetime('now', ?))
+        """, (f"-{MEMORY_TTL_CONFIRMED} days",
+              f"-{MEMORY_TTL_FALSE_POSITIVE} days")).rowcount
+        return n
+
+
 def remember_verdict(chat_id: int, text: str, label: str,
                      source: str = "admin") -> bool:
     """记住一条人工裁决，供后续同类内容复用。
@@ -937,7 +1025,11 @@ def remember_verdict(chat_id: int, text: str, label: str,
     label: false_positive（误删，以后别删）| confirmed（确认是广告，以后直接删）
     """
     norm = normalize_for_hash(text)
-    if len(norm) < 3:
+    if len(norm) < MEMORY_MIN_CHARS:
+        return False
+    ok, why = _memory_allowed(chat_id, norm, label)
+    if not ok:
+        logger.warning("拒绝写入判定记忆（%s）: %r", why, (text or "")[:40])
         return False
     try:
         execute("""INSERT INTO verdict_memory

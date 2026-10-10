@@ -492,8 +492,23 @@ async def main():
     for i, t in enumerate(HAM):
         db.save_message(cid8, 6000 + i, 2, "群友", t, None, "2026-10-10 12:00:00")
 
+    # 语料纯度门槛（绝对值 >= 200 条正常消息）会先拦一道。
+    # 这个测试只造了 13 条正常消息，所以**预期被跳过**——这正是门槛在生效。
     st = learner.refresh_candidates(cid8)
-    print("  挖掘: 候选=%d 过闸=%d 入库=%d" % (st["candidates"], st["passed"], st["added"]))
+    print("  仅 13 条正常语料 -> %s" % ("跳过：%s" % st.get("reason")
+                                        if st.get("skipped") else "开始挖掘"))
+    assert st.get("skipped"), "语料不足时必须跳过（绝对值门槛）"
+    print("     ✓ 语料纯度门槛生效（防止在假阴性语料上产出规则）")
+
+    # 补足正常语料后，学习应恢复
+    for i in range(220):
+        db.save_message(cid8, 7000 + i, 3, "群友",
+                        "正常聊天内容 %d 随便聊聊" % i, None,
+                        "2026-10-10 12:00:00")
+    st = learner.refresh_candidates(cid8)
+    print("  补足正常语料后: 候选=%d 过闸=%d 入库=%d"
+          % (st.get("candidates", 0), st.get("passed", 0), st.get("added", 0)))
+    assert not st.get("skipped"), "语料充足后应恢复学习"
     assert st["passed"] > 0, "应有候选通过零命中闸门"
 
     pats = db.patterns_for_shadow()
@@ -670,14 +685,18 @@ async def main():
     assert st.get("skipped"), "正常语料过少时必须跳过学习"
     print("      -> 已跳过，不会在证据不足时放权 ✓")
 
-    # 补足正常语料后应恢复学习
-    for i in range(30):
+    # 补足正常语料后应恢复学习。
+    # 注意要同时满足**比值**（>=0.5）与**绝对条数**（>=200）两道门槛：
+    # 40 条广告配 33 条正常只满足比值，绝对条数不够 —— 实测踩到过。
+    for i in range(220):
         db.save_message(cidA, 8200 + i, 2, "群友", "正常聊天补充 %d 内容" % i,
                         None, "2026-10-10 12:00:00")
     st = learner.refresh_candidates(cidA)
     print("  补足正常语料后 -> skipped=%s spam=%s ham=%s"
           % (st.get("skipped"), st.get("spam"), st.get("ham")))
     assert not st.get("skipped"), "语料充足后应恢复学习"
+    print("     两道门槛都过了（比值 %.2f，绝对 %s 条）"
+          % (st["ham"] / max(1, st["spam"]), st["ham"]))
 
     # 上限告警：limit 设很小应触发告警（这里只验证不会静默）
     sp, ha = learner.load_corpus(cidA, limit=5)
@@ -1019,10 +1038,14 @@ async def main():
     print("  (d) 同时存在两种记忆时取=%s（应 false_positive，优先保护真人）" % got_p)
     assert got_p == "false_positive", "误删记忆应优先"
 
-    # (e) 太短的内容不记忆（避免把 'ok' 这类记成永久规则）
-    print("  (e) 过短内容是否记忆: %s（应 False）"
-          % db.remember_verdict(cidM, "ok", "confirmed"))
-    assert not db.remember_verdict(cidM, "ok", "confirmed")
+    # (e) 单字不记忆（下限 2）。
+    # 注意 'ok' 这类 2 字符是**允许**的——判"它是不是常用语"交给负样本零命中
+    # 闸门，而不是交给字符长度（实测长度切不干净：广告和正常在 1-2 字符档
+    # 分别占 13.7% 和 21.7%）。
+    for one in ("a", "1", "？"):
+        assert not db.remember_verdict(cidM, one, "confirmed"), \
+            "单字不该被记住: %r" % one
+    print("  (e) 单字不记忆: 'a' / '1' / '？' 均拒绝 ✓")
 
     print("  记忆条数=%d" % len(db.verdict_memory_list(cidM)))
 
@@ -1328,6 +1351,56 @@ async def main():
     b = db.get_review_batch(bid)
     assert b["cursor"] == 1 and b["done"] == 1
     print("  ✓ 进度可推进（cursor=%s done=%s）" % (b["cursor"], b["done"]))
+
+    print("=== 33. 回归：判定记忆用负样本零命中闸门（不靠字符长度）===")
+    # code review 提议把判定记忆的下限从 3 提到 8，用户觉得 8 太长。
+    # 实测证明用户是对的，而且**字符长度根本不是好的判别维度**：
+    #   广告里归一化长度 1-2 的占 13.7%，正常消息里占 21.7% —— 两侧都大量存在
+    #   下限提到 5 挡掉 37.4% 的广告，但 [3,5) 区间仍有 13 个高频正常短语
+    #   下限提到 8 挡掉 57.1% 的广告（含 '尾课，上闩' 这类真广告），只多挡 3 个短语
+    # 而 '哈哈哈哈' 只有 4 字符，任何合理下限都挡不住它。
+    #
+    # 改用规则系统里同一个判据：confirmed 记忆必须**在正常语料里零命中**。
+    cidM2 = -1004
+    db.register_chat(cidM2, "记忆闸门测试群", "general", shadow_mode=False)
+    normal = ["哈哈哈哈", "今日排行", "储物袋", "今日发言", "签到", "导航",
+              "大家好", "有空", "在啦", "哈喽"]
+    for i, t in enumerate(normal):
+        db.save_message(cidM2, 30000 + i, 2, "群友", t, None,
+                        "2026-10-11 00:00:00")
+
+    print("  confirmed 必须过闸门（会被全群永久直删）:")
+    for text, expect in [("哈哈哈哈", False), ("今日排行", False),
+                         ("储物袋", False), ("大家好", False),
+                         ("签到", False),
+                         ("尾课，上闩", True), ("大四外出❤️", True),
+                         ("甜妹", True)]:
+        ok = db.remember_verdict(cidM2, text, "confirmed", "test")
+        print("    [%s] %-8s %r"
+              % ("OK" if ok == expect else "FAIL",
+                 "允许" if ok else "拒绝", text[:14]))
+        assert ok == expect, "%r 期望 %s 实际 %s" % (text, expect, ok)
+
+    print("  false_positive 不需要闸门（只放行，方向安全）:")
+    for text in ("哈哈哈哈", "签到", "一直都在呢"):
+        ok = db.remember_verdict(cidM2, text, "false_positive", "test")
+        assert ok, "%r 应被允许" % text
+    print("    全部允许 ✓")
+
+    print("  单字仍被下限挡住:")
+    for text in ("a", "1"):
+        assert not db.remember_verdict(cidM2, text, "confirmed", "test")
+    print("    'a' / '1' 均拒绝 ✓")
+
+    # 过期清理
+    db.execute("UPDATE verdict_memory SET created_at=datetime('now','-200 days') "
+               "WHERE label='confirmed'")
+    db.execute("UPDATE verdict_memory SET created_at=datetime('now','-400 days') "
+               "WHERE label='false_positive'")
+    n = db.purge_expired_memory()
+    print("  过期清理: 清掉 %d 条（confirmed>90天 / false_positive>365天）" % n)
+    assert n > 0, "应清掉过期记忆"
+    assert not db.verdict_memory_list(cidM2), "清理后应为空"
 
     os.unlink(tmp)
     print("\n全部通过")

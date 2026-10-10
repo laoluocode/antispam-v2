@@ -1541,13 +1541,18 @@ async def job_self_evolve(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception as exc:  # noqa: BLE001
             logger.warning("自进化失败 chat=%s: %s", cid, exc)
 
-    # 顺带清理过旧的判定记录（30 天），避免无限增长
+    # 顺带清理过旧的数据，避免无限增长
     try:
         pruned = await asyncio.to_thread(db.prune_verdict_log, 30)
         if pruned:
             logger.info("清理判定记录 %d 条（保留 30 天）", pruned)
+        # 判定记忆也会过期：confirmed 90 天、false_positive 365 天。
+        # 永久生效的记忆有风险——群话题会变、当时的判断尺度也可能偏。
+        expired = await asyncio.to_thread(db.purge_expired_memory)
+        if expired:
+            logger.info("清理过期判定记忆 %d 条", expired)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("清理判定记录失败: %s", exc)
+        logger.warning("清理过期数据失败: %s", exc)
 
     if total_promoted:
         # 规则库变了，强制重载让 L0 立刻用上
