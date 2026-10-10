@@ -264,6 +264,17 @@ class ChatPipeline:
             await asyncio.to_thread(db.log_verdict, self.chat_id,
                                     msg.message_id, msg.user_id, 1.0,
                                     "local_rule", True, ",".join(msg.triggers))
+            # L0 命中也是**真值已知**（确定是广告），所以同样要记 shadow 命中。
+            #
+            # 这是一个曾经自我阻碍的设计：原来只在 LLM 判定后记 shadow 命中，
+            # 而 L0 命中就提前 return 了——于是所有被 L0 拦下的广告
+            # **从未参与 shadow 统计**。实测后果：66 条 shadow 规则最高只攒到
+            # 3 次命中（毕业需 10 次），而同期删了 1845 条。
+            # 规则永远毕不了业，自进化形同虚设。
+            try:
+                await asyncio.to_thread(record_shadow_hits, msg.text, True)
+            except Exception:  # noqa: BLE001
+                pass
             return Verdict(msg, True, 1.0, "local_rule", v.reason)
 
         # --- 判定记忆（人工裁决过的内容直接复用结论）---
@@ -298,6 +309,11 @@ class ChatPipeline:
                                     msg.message_id, msg.user_id, 1.0,
                                     "local_rule", True, "账号资料")
             return Verdict(msg, True, 1.0, "local_rule", pv.reason)
+            try:
+                await asyncio.to_thread(record_shadow_hits, msg.text, True)
+            except Exception:  # noqa: BLE001
+                pass
+
 
         # --- 自进化规则（已毕业的直拦）---
         # 这些规则通过了"负样本零命中"闸门与 shadow 观察期，才有资格直拦。
@@ -305,6 +321,11 @@ class ChatPipeline:
         if lv.hit:
             await asyncio.to_thread(db.mark_checked, [msg.row_id])
             return Verdict(msg, True, 1.0, "learned", lv.reason)
+            try:
+                await asyncio.to_thread(record_shadow_hits, msg.text, True)
+            except Exception:  # noqa: BLE001
+                pass
+
 
         # --- inline 按钮检测 ---
         # 广告号把广告做成按钮（"加入频道｜领取福利"），正文可以完全干净。

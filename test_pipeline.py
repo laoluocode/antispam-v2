@@ -1025,6 +1025,61 @@ async def main():
 
     print("  记忆条数=%d" % len(db.verdict_memory_list(cidM)))
 
+    print("=== 27. 回归：L0 命中也要记 shadow 统计（自进化的自我阻碍）===")
+    # 实测发现的严重设计缺陷：原来只在 LLM 判定后记 shadow 命中，
+    # 而 L0 命中就提前 return 了——于是所有被 L0 拦下的广告
+    # **从未参与 shadow 统计**。
+    # 后果：66 条 shadow 规则最高只攒到 3 次命中（毕业需 10 次），
+    # 而同期删了 1845 条。规则永远毕不了业，自进化形同虚设。
+    from detector_rules import load_patterns, record_shadow_hits
+
+    cidS = -996
+    db.register_chat(cidS, "shadow统计测试群", "general", shadow_mode=False)
+    db.set_chat_field(cidS, "shadow_mode", 0)
+    db.set_chat_field(cidS, "username", "testgroup")
+    db.set_chat_field(cidS, "managed_links", "testgroup")
+
+    # 造一条 shadow 规则
+    ad_text = "限时特价液课上门服务"
+    db.add_pattern(cidS, "特价液课", mode="shadow")
+    load_patterns(force=True)
+    print("  shadow 规则已入库，初始命中=%s"
+          % db.query("SELECT shadow_hits FROM spam_patterns LIMIT 1")[0]["shadow_hits"])
+
+    # 用一个**会被 L0 拦下**的内容（含手机号 -> check_local 命中）
+    # 同时它也命中 shadow 规则 "特价液课"
+    text = "特价液课 电１３８００００００００"
+    rid = db.save_message(cidS, 9900, 51, "广告号", text, None, "t")
+    pS = ChatPipeline(cidS, Graded({}), noop, None)
+    v = await pS.submit(PendingMessage(rid, 9900, cidS, 51, "广告号", text, None, "t"))
+    print("  判定结果: %s (%s)" % ("L0 命中" if (v and v.is_spam) else "未命中",
+                                  v.reason if v else ""))
+    assert v and v.is_spam, "含手机号应被 L0 拦下"
+
+    hits = db.query("SELECT shadow_hits, shadow_spam_hits FROM spam_patterns")[0]
+    print("  L0 命中后 shadow 统计: hits=%s spam_hits=%s（应都 >=1）"
+          % (hits["shadow_hits"], hits["shadow_spam_hits"]))
+    assert (hits["shadow_hits"] or 0) >= 1, \
+        "L0 拦下的广告必须计入 shadow 统计，否则规则永远攒不够毕业所需命中"
+
+    # 攒够后应能毕业
+    for _ in range(12):
+        db.bump_pattern("特价液课", shadow_hit=True, spam_hit=True)
+    from learner import eligible_for_promotion
+    elig = eligible_for_promotion(cidS)
+    print("  攒够命中后可毕业: %s" % [r["pattern"] for r in elig])
+    assert any(r["pattern"] == "特价液课" for r in elig), "应可毕业"
+
+    # 反向：有误命中的规则不能毕业（闸门仍然有效）
+    db.add_pattern(cidS, "武汉养生", mode="shadow")
+    for _ in range(12):
+        db.bump_pattern("武汉养生", shadow_hit=True, spam_hit=False)  # 有误命中
+    elig2 = eligible_for_promotion(cidS)
+    names = [r["pattern"] for r in elig2]
+    print("  有误命中的规则是否可毕业: %s（应不含 武汉养生）"
+          % ("含!" if "武汉养生" in names else "不含 ✓"))
+    assert "武汉养生" not in names, "有误命中的规则不得毕业"
+
     os.unlink(tmp)
     print("\n全部通过")
 

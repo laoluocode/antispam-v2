@@ -370,19 +370,30 @@ def load_patterns(force: bool = False) -> list:
     now = time.time()
     if not force and now - _pattern_cache_at < PATTERN_CACHE_TTL:
         return _pattern_cache
+    # 直接 import db，不要写 "try: from database ... except ImportError" 那种回退。
+    #
+    # 那是个极隐蔽的坑：`database` 是**老 bot 的模块**（另一个 schema），
+    # 在容器里它 import 是**成功**的（不触发 ImportError），于是拿它去查
+    # spam_patterns 表必然失败——而 except 把错误吞掉了，静默返回空缓存。
+    # 结果：自进化规则**从上线起就没被加载过**，66 条规则全是摆设。
     try:
-        from database import active_patterns, patterns_for_shadow
+        import db as _db
     except ImportError:
-        from db import active_patterns, patterns_for_shadow
+        _db = None
+    if _db is None:
+        logger.error("无法加载规则库模块，自进化规则不可用")
+        return _pattern_cache
+
     try:
         active = [(r["pattern"], "active", r["hit_count"] or 0)
-                  for r in active_patterns()]
+                  for r in _db.active_patterns()]
         shadow = [(r["pattern"], "shadow", r["shadow_hits"] or 0)
-                  for r in patterns_for_shadow()]
+                  for r in _db.patterns_for_shadow()]
         _pattern_cache = active + shadow
         _pattern_cache_at = now
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception as exc:  # noqa: BLE001
+        # 不能静默：加载失败意味着自进化完全失效，必须看得见
+        logger.error("加载自进化规则失败: %s: %s", type(exc).__name__, exc)
     return _pattern_cache
 
 
@@ -438,10 +449,7 @@ def record_shadow_hits(text: str, is_spam: bool) -> list[str]:
         if _pattern_matches(pattern, t, norm):
             hits.append(pattern)
     if hits:
-        try:
-            from database import bump_pattern
-        except ImportError:
-            from db import bump_pattern
+        from db import bump_pattern
         for pattern in hits:
             try:
                 bump_pattern(pattern, shadow_hit=True, spam_hit=is_spam)
