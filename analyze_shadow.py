@@ -140,10 +140,31 @@ def report(res: dict, cut: float, days: int, limit: int) -> None:
     print("=" * 78)
 
     if not res["has_old"]:
-        print("  ⚠️ 未找到老库，只报告新 bot 的判定")
-        print(f"  新 bot 判定为广告：{len(res['only_new']) + len(res['both'])} 条")
-        for v in (res["only_new"] + res["both"])[:limit]:
-            print(f"    [{v['conf']:.2f}] {_why(v['text']):22s} {v['text'][:44]!r}")
+        # 新群没有老 bot 做对照，也就没有免费的真值标签。
+        # 这时分析器的价值是"把模型的判断摊开给人看"，让人补标注。
+        spam = res["only_new"] + res["both"]
+        print("  ⚠️ 本库没有可对照的老 bot（新群场景），只能人工标注")
+        print()
+        print(f"  新 bot 判为广告：{len(spam)} 条")
+        print()
+        print("  处理方式：扫下面这份清单，")
+        print("    · 判对了 → 无需操作（它已经是正例）")
+        print("    · 判错了 → 用 --add-negative \"文本\" 写成反例")
+        print("    · 漏了的 → 用 --add-positive \"文本\" 写成正例")
+        print()
+        print("  按置信度分档（低档更可能判错，优先看）:")
+        for lo, hi, label in ((0.0, 0.6, "0.50-0.59 最可疑"),
+                              (0.6, 0.8, "0.60-0.79 需确认"),
+                              (0.8, 0.9, "0.80-0.89 较可信"),
+                              (0.9, 1.01, "0.90-1.00 高可信")):
+            items = [v for v in spam if lo <= v["conf"] < hi]
+            if not items:
+                continue
+            print(f"\n  ▸ {label}  共 {len(items)} 条")
+            for v in items[:limit]:
+                print(f"      [{v['conf']:.2f}] {_why(v['text']):20s} {v['text'][:44]!r}")
+            if len(items) > limit:
+                print(f"      …另有 {len(items) - limit} 条")
         return
 
     both, only_new, only_old = res["both"], res["only_new"], res["only_old"]
@@ -227,9 +248,11 @@ def export_csv(res: dict, path: str, cut: float) -> None:
         w = csv.writer(f)
         w.writerow(["类别", "chat_id", "message_id", "置信度", "信任标记",
                     "昵称", "内容", "特征", "老bot理由"])
-        for label, items in (("两边一致", res["both"]),
-                             ("仅新bot判删", res["only_new"]),
-                             ("仅老bot删了", res["only_old"])):
+        groups = ([("两边一致", res["both"]), ("仅新bot判删", res["only_new"]),
+                   ("仅老bot删了", res["only_old"])]
+                  if res["has_old"] else
+                  [("新bot判删", res["only_new"] + res["both"])])
+        for label, items in groups:
             for v in items:
                 w.writerow([label, v["chat_id"], v["message_id"],
                             f"{v['conf']:.2f}", "", v["name"], v["text"],
@@ -240,7 +263,9 @@ def export_csv(res: dict, path: str, cut: float) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--new-db", default=NEW_DB_DEFAULT)
-    ap.add_argument("--old-db", default=OLD_DB_DEFAULT)
+    ap.add_argument("--old-db", default=OLD_DB_DEFAULT,
+                    help="对照用的老 bot 库。只在你自己的群（新老并存）时才有意义；"
+                         "新群没有对照，留空即可")
     ap.add_argument("--days", type=int, default=3)
     ap.add_argument("--chat-id", type=int, default=0, help="只看某个群（0=全部）")
     ap.add_argument("--cut", type=float, default=None,
